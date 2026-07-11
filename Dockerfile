@@ -13,9 +13,15 @@
 FROM python:3.10-slim
 
 # ── System dependencies ─────────────────────────────────────────
-# curl: healthchecks and Qdrant connectivity tests
+# curl:          healthchecks and Qdrant connectivity tests
+# tesseract-ocr: OCR engine for scanned PDFs (ENABLE_OCR=true)
+# poppler-utils: PDF-to-image renderer used by pdf2image (for OCR)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        tesseract-ocr \
+        tesseract-ocr-eng \
+        poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

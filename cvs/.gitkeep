@@ -1,0 +1,2 @@
+# Drop your CV files (PDF or DOCX) in this folder.
+# Then run: docker compose run indexer

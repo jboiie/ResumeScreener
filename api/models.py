@@ -13,17 +13,62 @@ from pydantic import BaseModel, Field
 # ── Request Models ─────────────────────────────────────────────────────────────
 
 class ScreeningFilters(BaseModel):
-    """Optional filters to narrow down candidates."""
+    """
+    Hard filters applied before LLM reranking.
+
+    Any candidate who fails a filter is excluded from results entirely —
+    they will not be passed to the LLM and will not appear in the response.
+
+    Important: filters only apply to candidates where the relevant metadata
+    was successfully extracted from their CV. Candidates where a field could
+    not be determined (e.g. experience_years is unknown) are included by
+    default and flagged in the response so reviewers can manually verify.
+    Set strict=true to exclude candidates with unknown metadata fields.
+    """
 
     min_experience: Optional[int] = Field(
         None,
         ge=0,
-        description="Minimum years of experience required",
+        description="Minimum years of total experience (inclusive)",
+    )
+    max_experience: Optional[int] = Field(
+        None,
+        ge=0,
+        description="Maximum years of total experience (inclusive)",
     )
     location: Optional[str] = Field(
         None,
-        description="Preferred candidate location (matched semantically by the LLM)",
+        description=(
+            "Filter by city or region. Case-insensitive substring match against "
+            "the location extracted from each CV. E.g. 'Delhi' matches 'Delhi NCR', "
+            "'New Delhi', etc."
+        ),
     )
+    required_skills: Optional[list[str]] = Field(
+        None,
+        description=(
+            "Candidate must have ALL listed skills present in their CV. "
+            "Skills are matched against a curated taxonomy (case-insensitive). "
+            "Example: ['Python', 'Docker', 'PostgreSQL']"
+        ),
+    )
+    strict: bool = Field(
+        False,
+        description=(
+            "If true, candidates whose metadata could not be extracted are excluded "
+            "when the corresponding filter is active. "
+            "If false (default), candidates with unknown metadata pass through with a flag."
+        ),
+    )
+
+    def is_active(self) -> bool:
+        """Return True if any filter field is set."""
+        return any([
+            self.min_experience is not None,
+            self.max_experience is not None,
+            self.location is not None,
+            self.required_skills is not None,
+        ])
 
 
 class ScreeningRequest(BaseModel):
@@ -42,18 +87,25 @@ class ScreeningRequest(BaseModel):
     )
     filters: ScreeningFilters = Field(
         default_factory=ScreeningFilters,
-        description="Optional filters (handled by LLM reranker)",
+        description="Optional hard filters applied before AI reranking",
     )
 
     model_config = {
         "json_schema_extra": {
             "examples": [
                 {
-                    "job_description": "We are looking for a Senior Python Developer with 5+ years of experience in FastAPI, PostgreSQL, and Docker. Experience with machine learning pipelines is a plus.",
+                    "job_description": (
+                        "We are looking for a Senior Python Developer with 5+ years of "
+                        "experience in FastAPI, PostgreSQL, and Docker. Experience with "
+                        "machine learning pipelines is a plus. Location: Delhi NCR."
+                    ),
                     "top_k": 10,
                     "filters": {
                         "min_experience": 5,
+                        "max_experience": 15,
                         "location": "Delhi",
+                        "required_skills": ["Python", "Docker"],
+                        "strict": False,
                     },
                 }
             ]
@@ -63,14 +115,54 @@ class ScreeningRequest(BaseModel):
 
 # ── Response Models ────────────────────────────────────────────────────────────
 
-class Candidate(BaseModel):
-    """A single ranked candidate."""
+class CandidateMetadata(BaseModel):
+    """
+    Structured metadata extracted from the candidate's CV.
+    All fields are optional — None means the field could not be extracted,
+    not that the candidate lacks the qualification.
+    """
+    experience_years: Optional[int] = Field(
+        None,
+        description="Extracted years of total experience (None if unknown)",
+    )
+    location: Optional[str] = Field(
+        None,
+        description="Canonical city name extracted from CV (None if unknown)",
+    )
+    location_raw: Optional[str] = Field(
+        None,
+        description="Raw location string as found in CV before normalization",
+    )
+    skills: list[str] = Field(
+        default_factory=list,
+        description="Skill keywords matched from the CV",
+    )
+    email: Optional[str] = Field(
+        None,
+        description="Contact email extracted from CV (None if not found)",
+    )
 
-    candidate_id: str = Field(description="Unique identifier for this candidate")
-    name: str = Field(description="Candidate's name extracted from their CV")
-    score: float = Field(ge=0.0, le=1.0, description="Fit score between 0.0 and 1.0")
-    match_reasoning: str = Field(description="One-sentence explanation of why this candidate fits")
-    cv_path: str = Field(description="Path to the candidate's CV file on the server")
+
+class Candidate(BaseModel):
+    """A single ranked candidate in the screening response."""
+
+    candidate_id:    str = Field(description="Unique identifier for this candidate")
+    name:            str = Field(description="Candidate name extracted from their CV")
+    score:           float = Field(ge=0.0, le=1.0, description="Fit score (0.0–1.0)")
+    match_reasoning: str = Field(description="One-sentence AI explanation of fit")
+    cv_path:         str = Field(description="Server-side path to the candidate's CV file")
+    metadata:        CandidateMetadata = Field(
+        default_factory=CandidateMetadata,
+        description="Structured metadata extracted from the CV",
+    )
+    filter_flags:    list[str] = Field(
+        default_factory=list,
+        description=(
+            "Warnings when a filter was active but the relevant metadata "
+            "could not be extracted. Example: ['experience_unknown']. "
+            "Empty list means all filter checks passed cleanly."
+        ),
+    )
 
 
 class ScreeningResponse(BaseModel):
@@ -78,19 +170,23 @@ class ScreeningResponse(BaseModel):
 
     job_id: str = Field(
         default_factory=lambda: str(uuid.uuid4()),
-        description="Unique ID for this screening request (for logging/tracking)",
+        description="Unique ID for this screening request",
     )
     candidates: list[Candidate] = Field(description="Ranked list of top candidates")
+    total_filtered_out: int = Field(
+        default=0,
+        description="Number of candidates excluded by hard filters before reranking",
+    )
     screened_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(),
-        description="ISO 8601 timestamp of when screening was performed",
+        description="ISO 8601 UTC timestamp of when screening ran",
     )
 
 
 class HealthResponse(BaseModel):
     """Response from GET /health"""
 
-    status: str = Field(description="'healthy' or 'degraded'")
-    qdrant_connected: bool = Field(description="Whether the vector database is reachable")
-    model_loaded: bool = Field(description="Whether the embedding model is loaded in memory")
-    version: str = Field(default="1.0.0", description="API version")
+    status:           str  = Field(description="'healthy' or 'degraded'")
+    qdrant_connected: bool = Field(description="Whether Qdrant is reachable")
+    model_loaded:     bool = Field(description="Whether the embedding model is loaded")
+    version:          str  = Field(default="1.0.0")

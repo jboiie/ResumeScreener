@@ -16,7 +16,7 @@ import logging
 import os
 from typing import Any
 
-from api.models import Candidate
+from api.models import Candidate, CandidateMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +34,24 @@ _LLM_TIMEOUT_SECONDS = 20
 # ── Prompt Builder ─────────────────────────────────────────────────────────────
 
 def _build_prompt(jd_text: str, candidates: list[dict[str, Any]], top_k: int) -> str:
+    def _candidate_block(i: int, c: dict) -> str:
+        meta = c.get("metadata", {})
+        lines = [
+            f"--- Candidate {i + 1} ---",
+            f"ID: {c['candidate_id']}",
+            f"Name: {c['name']}",
+        ]
+        if meta.get("experience_years") is not None:
+            lines.append(f"Experience: {meta['experience_years']} years")
+        if meta.get("location"):
+            lines.append(f"Location: {meta['location']}")
+        if meta.get("skills"):
+            lines.append(f"Key Skills: {', '.join(meta['skills'][:15])}")
+        lines.append(f"CV Excerpt:\n{c['best_chunk_text'][:800]}")
+        return "\n".join(lines)
+
     candidate_sections = "\n\n".join(
-        f"--- Candidate {i + 1} ---\n"
-        f"ID: {c['candidate_id']}\n"
-        f"Name: {c['name']}\n"
-        f"CV Excerpt:\n{c['best_chunk_text'][:800]}"
-        for i, c in enumerate(candidates)
+        _candidate_block(i, c) for i, c in enumerate(candidates)
     )
 
     return f"""You are an expert recruitment assistant helping an HR team shortlist candidates.
@@ -171,6 +183,8 @@ def rerank_candidates(
                     score=min(1.0, max(0.0, float(item.get("score", meta["best_score"])))),
                     match_reasoning=str(item.get("reasoning", "")).strip(),
                     cv_path=meta["cv_path"],
+                    metadata=CandidateMetadata(**meta.get("metadata", {})),
+                    filter_flags=meta.get("filter_flags", []),
                 )
             )
 
@@ -199,6 +213,8 @@ def _fallback_ranking(candidates: list[dict[str, Any]], top_k: int) -> list[Cand
             score=round(c["best_score"], 4),
             match_reasoning="Ranked by semantic similarity (AI reranker temporarily unavailable).",
             cv_path=c["cv_path"],
+            metadata=CandidateMetadata(**c.get("metadata", {})),
+            filter_flags=c.get("filter_flags", []),
         )
         for c in sorted_candidates[:top_k]
     ]

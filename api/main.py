@@ -27,7 +27,7 @@ from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 
 from api.models import HealthResponse, ScreeningRequest, ScreeningResponse
-from api.retriever import retrieve_candidates
+from api.retriever import retrieve_candidates, build_candidate_response
 from api.reranker import rerank_candidates
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -215,29 +215,33 @@ async def screen_resumes(request: Request, body: ScreeningRequest):
 
     **Flow:**
     1. Job description is embedded using MiniLM (runs locally on the server).
-    2. Top candidates are retrieved from the vector database.
-    3. An LLM (Groq/Gemini) reranks candidates and writes one-line reasoning.
-    4. Top K candidates are returned with scores and reasoning.
+    2. Top candidates retrieved from the vector database.
+    3. Hard filters applied (experience, location, required skills).
+    4. An LLM (Groq/Gemini) reranks remaining candidates with reasoning.
+    5. Top K candidates returned with scores, reasoning, and metadata.
 
     **Typical response time:** 3–8 seconds (dominated by LLM API latency).
     """
     settings: Settings = request.app.state.settings
     top_k = body.top_k or settings.default_top_k
 
+    has_filters = body.filters.is_active()
     logger.info(
-        "Screening request received: top_k=%d, jd_length=%d chars",
+        "Screening request: top_k=%d, jd=%d chars, filters=%s",
         top_k,
         len(body.job_description),
+        body.filters.model_dump(exclude_none=True) if has_filters else "none",
     )
 
-    # ── Step 1: Vector Retrieval ─────────────────────────────────
+    # ── Step 1: Vector Retrieval + Hard Filtering ────────────────
     try:
-        candidates = retrieve_candidates(
+        raw_candidates, n_filtered_out = retrieve_candidates(
             qdrant_client=request.app.state.qdrant,
             model=request.app.state.model,
             jd_text=body.job_description,
             collection_name=settings.qdrant_collection,
             top_n=settings.retrieval_top_n,
+            filters=body.filters,
         )
     except Exception as exc:
         logger.error("Retrieval failed: %s", exc, exc_info=True)
@@ -246,9 +250,17 @@ async def screen_resumes(request: Request, body: ScreeningRequest):
             detail="Vector retrieval failed. Is Qdrant running and the collection indexed?",
         )
 
-    if not candidates:
-        logger.warning("No candidates found. Has the CV collection been indexed?")
-        return ScreeningResponse(candidates=[])
+    if not raw_candidates:
+        msg = (
+            "No candidates passed the applied filters."
+            if has_filters and n_filtered_out > 0
+            else "No candidates found. Has the CV collection been indexed?"
+        )
+        logger.warning(msg)
+        return ScreeningResponse(candidates=[], total_filtered_out=n_filtered_out)
+
+    # Reshape raw dicts into the format reranker + response builder expect
+    candidates = [build_candidate_response(c) for c in raw_candidates]
 
     # ── Step 2: LLM Reranking ────────────────────────────────────
     ranked = rerank_candidates(
@@ -257,5 +269,9 @@ async def screen_resumes(request: Request, body: ScreeningRequest):
         top_k=top_k,
     )
 
-    logger.info("Returning %d ranked candidates", len(ranked))
-    return ScreeningResponse(candidates=ranked)
+    logger.info(
+        "Returning %d candidates (%d filtered out by hard filters)",
+        len(ranked),
+        n_filtered_out,
+    )
+    return ScreeningResponse(candidates=ranked, total_filtered_out=n_filtered_out)

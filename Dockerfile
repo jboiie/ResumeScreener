@@ -1,0 +1,52 @@
+# ══════════════════════════════════════════════════════════════
+#  Resume Screener — Dockerfile
+#
+#  Single image used for both the API service and the indexer.
+#  CMD is overridden in docker-compose.yml per service.
+#
+#  Key choices:
+#    - python:3.10-slim  → small base, no unnecessary extras
+#    - CPU-only torch    → avoids 3 GB+ CUDA download
+#    - Model pre-baked   → no download on first container start
+# ══════════════════════════════════════════════════════════════
+
+FROM python:3.10-slim
+
+# ── System dependencies ─────────────────────────────────────────
+# curl: healthchecks and Qdrant connectivity tests
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Python dependencies ─────────────────────────────────────────
+# Install CPU-only PyTorch FIRST using the official CPU wheel index.
+# This prevents pip from downloading the ~2 GB CUDA variant that
+# sentence-transformers would otherwise pull in automatically.
+RUN pip install --no-cache-dir \
+    torch \
+    --index-url https://download.pytorch.org/whl/cpu
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ── Pre-download embedding model ────────────────────────────────
+# Bakes the model into the image so first startup is instant.
+# The model (~90 MB) is stored in the HuggingFace cache inside the image.
+RUN python -c "\
+from sentence_transformers import SentenceTransformer; \
+print('Downloading all-MiniLM-L6-v2 ...'); \
+SentenceTransformer('all-MiniLM-L6-v2'); \
+print('Model ready.')"
+
+# ── Application code ────────────────────────────────────────────
+COPY api/      ./api/
+COPY indexer/  ./indexer/
+
+# Persistent directories (mounted from host via docker-compose volumes)
+RUN mkdir -p cvs data
+
+# ── Default command (API service) ───────────────────────────────
+# Overridden to "python -m indexer.run" for the indexer profile.
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

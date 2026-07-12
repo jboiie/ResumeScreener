@@ -1,103 +1,259 @@
-# 🔍 Resume Screener
+# Resume Screener — RAG-Powered CV Screening Microservice
 
-**AI-powered candidate shortlisting — paste a job description, get your top candidates in seconds.**
+> **For the incoming developer:** This document is written to be consumed directly by you and your agentic IDE. Every section is intentionally verbose. Read it top to bottom once before touching any code.
 
-A self-contained microservice that uses semantic AI search to rank your entire CV database against any job description. Runs 100% on your own server. No cloud storage. No data leaves your network except one API call to an AI provider for reranking.
+A production-ready, self-hosted REST microservice that accepts a **Job Description** and returns the **top N most relevant candidates** from a database of up to 20,000 CVs. Built on a Retrieval-Augmented Generation (RAG) pipeline. Delivered as a Docker Compose product that runs on a single server with no GPU required.
 
 ---
 
 ## Table of Contents
 
-1. [How It Works (30-second version)](#how-it-works)
-2. [System Requirements](#system-requirements)
-3. [First-Time Setup](#first-time-setup)
-4. [Loading Your CVs (Indexing)](#loading-your-cvs-indexing)
-5. [Starting & Stopping the Service](#starting--stopping-the-service)
-6. [For HR: How to Use](#for-hr-how-to-use)
-7. [ERP Integration Guide](#erp-integration-guide)
-   - [Authentication](#authentication)
-   - [API Reference](#api-reference)
-   - [Code Examples](#code-examples)
-   - [Integration Patterns](#integration-patterns)
-   - [Error Reference](#error-reference)
-8. [Configuration Reference](#configuration-reference)
-9. [Updating CVs](#updating-cvs)
-10. [Monitoring & Health](#monitoring--health)
-11. [Troubleshooting](#troubleshooting)
-12. [Architecture](#architecture)
-13. [FAQ](#faq)
+1. [System Architecture](#1-system-architecture)
+2. [Project Structure](#2-project-structure)
+3. [How It Works — Full Pipeline](#3-how-it-works--full-pipeline)
+4. [Tech Stack & Dependency Decisions](#4-tech-stack--dependency-decisions)
+5. [First-Time Setup (Operators)](#5-first-time-setup-operators)
+6. [Environment Variables Reference](#6-environment-variables-reference)
+7. [Indexing CVs](#7-indexing-cvs)
+8. [API Reference](#8-api-reference)
+9. [ERP Integration Guide](#9-erp-integration-guide)
+10. [Metadata Filtering System](#10-metadata-filtering-system)
+11. [OCR Support for Scanned PDFs](#11-ocr-support-for-scanned-pdfs)
+12. [Monitoring & Maintenance](#12-monitoring--maintenance)
+13. [Updating & Re-indexing](#13-updating--re-indexing)
+14. [Troubleshooting](#14-troubleshooting)
+15. [Developer Handoff Notes](#15-developer-handoff-notes)
+16. [FAQ](#16-faq)
 
 ---
 
-## How It Works
+## 1. System Architecture
 
 ```
-HR pastes a Job Description
-          │
-          ▼
-  Resume Screener API
-          │
-          ├─ 1. Converts JD to a semantic vector (AI math, on your server)
-          ├─ 2. Finds the 30 most similar CV chunks in the database
-          ├─ 3. Deduplicates to unique candidates
-          └─ 4. Asks Groq/Gemini AI to rank and explain the top matches
-          │
-          ▼
-  Returns top 5–10 candidates with name, score, and reasoning
+┌─────────────────────────────────────────────────────────────────┐
+│                        CLIENT SERVER                            │
+│                                                                 │
+│  ┌──────────────┐    ┌──────────────────────────────────────┐  │
+│  │   HR / ERP   │    │         Docker Compose Stack         │  │
+│  │  (browser /  │───▶│                                      │  │
+│  │   REST call) │    │  ┌──────────────┐  ┌──────────────┐ │  │
+│  └──────────────┘    │  │   FastAPI    │  │    Qdrant    │ │  │
+│                      │  │  (api svc)   │◀▶│  Vector DB   │ │  │
+│  ┌──────────────┐    │  │  port 8000   │  │  port 6333   │ │  │
+│  │   CV Files   │    │  └──────┬───────┘  └──────────────┘ │  │
+│  │  (PDF/DOCX)  │    │         │                            │  │
+│  │  on host FS  │    │  ┌──────▼───────┐                   │  │
+│  └──────┬───────┘    │  │  Groq/Gemini │ (external, HTTPS) │  │
+│         │            │  │   LLM API    │                   │  │
+│         │            │  └──────────────┘                   │  │
+│         ▼            │                                      │  │
+│  ┌──────────────┐    │  ┌──────────────┐                   │  │
+│  │   Indexer    │───▶│  │  data/ dir   │                   │  │
+│  │ (run once,   │    │  │ index_state  │                   │  │
+│  │  then as     │    │  │   .json      │                   │  │
+│  │  needed)     │    │  └──────────────┘                   │  │
+│  └──────────────┘    └──────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-The entire CV database is stored locally. Only the final ranking step contacts an external AI provider (Groq or Gemini), and only the text of ~10 candidate summaries is sent — never the full CVs.
+**Three Docker services:**
+
+| Service | Image | Role | Restart |
+|---|---|---|---|
+| `qdrant` | `qdrant/qdrant:v1.9.2` | Vector database storing all CV embeddings | Always |
+| `api` | `resume-screener:latest` (built from `Dockerfile`) | FastAPI server handling screening requests | Always |
+| `indexer` | `resume-screener:latest` (same image) | One-shot CV indexer, run manually | Never (profile-gated) |
 
 ---
 
-## System Requirements
+## 2. Project Structure
 
-| Requirement | Minimum | Notes |
+```
+RAGScreeningResume/
+│
+├── api/                        # FastAPI application
+│   ├── __init__.py
+│   ├── main.py                 # App factory, lifespan, routes, auth middleware
+│   ├── models.py               # Pydantic request/response models (API contract)
+│   ├── retriever.py            # Qdrant vector search + post-retrieval filtering
+│   └── reranker.py             # Groq/Gemini LLM reranking with fallback
+│
+├── indexer/                    # CV indexing pipeline
+│   ├── __init__.py
+│   ├── run.py                  # Orchestrator: walks CV folder, manages state
+│   ├── parser.py               # PDF (text + OCR) and DOCX text extraction
+│   ├── embedder.py             # Batch MiniLM embedding + Qdrant upsert
+│   ├── metadata.py             # Regex extraction: experience, location, skills, email
+│   └── utils.py                # MD5 hashing, atomic state file, logging setup
+│
+├── cvs/                        # Drop CV files here (PDF or DOCX)
+│   └── .gitkeep                # Keeps folder in git; actual CVs are gitignored
+│
+├── data/                       # Auto-generated runtime state
+│   └── .gitkeep                # index_state.json appears here after first indexing
+│
+├── Dockerfile                  # CPU-only build; pre-bakes embedding model
+├── docker-compose.yml          # Three-service orchestration
+├── requirements.txt            # Python dependencies
+├── .env.example                # Configuration template (copy to .env)
+└── README.md                   # This file
+```
+
+---
+
+## 3. How It Works — Full Pipeline
+
+### 3a. Indexing Phase (run once, then as needed)
+
+```
+CV File (PDF or DOCX)
+        │
+        ▼
+  [parser.py] ──── pdfplumber reads text layer
+        │           If < 100 chars extracted AND ENABLE_OCR=true:
+        │           └── pdf2image converts pages → Tesseract OCR
+        │
+        ▼
+  Raw text extracted
+        │
+        ▼
+  [metadata.py] ── Regex extracts:
+        │           • experience_years (int | None)
+        │           • location (normalized city name | None)
+        │           • location_raw (original string | None)
+        │           • skills (list[str] from 130+ taxonomy)
+        │           • email (str | None)
+        │
+        ▼
+  Text chunked into 400-word windows (50-word overlap)
+        │
+        ▼
+  [embedder.py] ── all-MiniLM-L6-v2 encodes each chunk → 384-dim vector
+        │
+        ▼
+  Qdrant upsert: each chunk stored as a point with:
+    { vector: [384 floats], payload: {candidate_id, name, cv_path,
+      chunk_text, experience_years, location, location_raw,
+      skills, email, ocr_used} }
+        │
+        ▼
+  [utils.py] ── index_state.json updated with MD5 hash of file
+                 (enables incremental re-indexing: unchanged files skipped)
+```
+
+**Memory profile at 20,000 CVs:**
+- ~8 chunks/CV × 20,000 = 160,000 vectors
+- 384 floats × 4 bytes × 160,000 = ~245 MB in Qdrant
+- Plus payload storage: ~400 MB total on disk
+
+### 3b. Screening Phase (per API request)
+
+```
+POST /api/v1/screen
+{ job_description: "...", top_k: 10, filters: {...} }
+        │
+        ▼
+  [api/main.py] ── Auth middleware validates X-API-Key header
+        │
+        ▼
+  [api/retriever.py]
+        │
+        ├── 1. Embed JD text → 384-dim vector (MiniLM, ~50ms CPU)
+        │
+        ├── 2. Qdrant cosine similarity search
+        │      top_n = 30 normally
+        │      top_n = 90 when filters are active (3× buffer)
+        │      Returns top chunks across all candidates (~100-500ms)
+        │
+        ├── 3. Deduplicate by candidate_id
+        │      Keep highest-scoring chunk per person
+        │      Merge metadata from that chunk's payload
+        │
+        └── 4. Apply hard filters (Python, in-memory):
+               • min_experience / max_experience  → experience_years range check
+               • location                         → substring match on location + location_raw
+               • required_skills                  → ALL skills must be in candidate's skill list
+               • strict=false (default)           → unknown metadata passes through + flagged
+               • strict=true                      → unknown metadata excluded
+        │
+        ▼
+  [api/reranker.py]
+        │
+        ├── Build prompt: JD text + up to 10 candidate blocks
+        │   Each block includes: name, experience, location, skills, CV excerpt
+        │
+        ├── Call LLM (Groq llama-3.1-8b-instant OR Gemini 1.5-flash)
+        │   20-second timeout
+        │
+        ├── Parse JSON response: [{candidate_id, score, reasoning}]
+        │
+        └── On ANY failure (timeout, bad JSON, rate limit, network):
+               → Fallback: sort by Qdrant vector score instead
+               → match_reasoning = "Ranked by semantic similarity..."
+               → Service never returns 500 due to LLM issues
+        │
+        ▼
+  ScreeningResponse returned:
+  {
+    job_id, screened_at, total_filtered_out,
+    candidates: [{ candidate_id, name, score, match_reasoning,
+                   cv_path, metadata, filter_flags }]
+  }
+```
+
+---
+
+## 4. Tech Stack & Dependency Decisions
+
+| Component | Choice | Why |
 |---|---|---|
-| **Docker** | Docker Desktop 4.x+ | [Download here](https://www.docker.com/products/docker-desktop/) |
-| **RAM** | 4 GB | 2 GB for Qdrant + 1.5 GB for the API + OS overhead |
-| **Disk** | 5 GB free | ~1 GB for Docker images, rest for CV storage |
-| **CPU** | Any modern CPU | No GPU required |
-| **Internet** | Outbound HTTPS | Only needed for: initial setup (pull images), AI reranking calls |
-| **OS** | Windows / Linux / macOS | All supported |
+| API framework | FastAPI 0.111+ | Async, OpenAPI docs auto-generated, Pydantic validation |
+| Embedding model | `all-MiniLM-L6-v2` (sentence-transformers) | 80MB, 384-dim, runs on CPU in ~50ms, excellent semantic quality |
+| Vector DB | Qdrant 1.9.2 | Docker-native, persistent, cosine search, no cloud dependency |
+| LLM reranker | Groq (llama-3.1-8b-instant) | Free tier, 30 req/min, <1s latency; Gemini as alternative |
+| PDF text extraction | pdfplumber | Better layout handling than PyPDF2; handles tables and columns |
+| PDF OCR | pytesseract + pdf2image + Tesseract | Open-source, runs locally, English language pack included |
+| DOCX extraction | python-docx | Official DOCX parser |
+| Deep learning | torch (CPU wheel only) | Installed from `https://download.pytorch.org/whl/cpu` — avoids 2GB+ CUDA build |
 
-> **Already have Docker?** Check your version: `docker --version` and `docker compose version`
+**Why CPU-only torch?**
+The client server has no GPU. The CPU wheel is ~250MB vs ~2GB for CUDA. MiniLM inference on CPU takes ~50ms per JD query, which is acceptable.
+
+**Why not Qdrant native filters?**
+Metadata extraction is best-effort — ~20-30% of CVs may have `null` for `experience_years` or `location`. Qdrant native range/match filters silently exclude nulls. Post-retrieval Python filtering lets us handle nulls explicitly: pass them through with a `filter_flag` (default) or exclude them (`strict=true`). This is a conscious design decision.
 
 ---
 
-## First-Time Setup
+## 5. First-Time Setup (Operators)
 
-This is a one-time process. Follow these steps in order.
+### Prerequisites
+- Docker Desktop (or Docker Engine + Docker Compose plugin) installed and running
+- Git installed
+- A Groq API key: [console.groq.com](https://console.groq.com) (free, 2 minutes to sign up)
+- A folder of CV files in PDF or DOCX format
 
-### Step 1 — Get the project files
+### Step 1 — Clone the repo
 
 ```bash
-# Clone the repository
 git clone https://github.com/aggamsingh/ResumeScreener.git
 cd ResumeScreener
 ```
 
-### Step 2 — Create your configuration file
+### Step 2 — Configure environment
 
 ```bash
-# Copy the template
 cp .env.example .env
 ```
 
-Now open `.env` in any text editor (Notepad, VS Code, etc.) and fill in:
+Open `.env` in any text editor and set **these three required values**:
 
 ```env
-# Your Groq API key (get a free one at https://console.groq.com)
-GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxx
-
-# A secret key your ERP will use to authenticate — make this long and random
-API_KEY=my-super-secret-key-change-this
-
-# Where your CV files are stored (use forward slashes even on Windows)
-CV_FOLDER_PATH=./cvs
+API_KEY=your-secret-key-here           # any strong random string, e.g. openssl rand -hex 32
+GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxx  # from console.groq.com → API Keys
+CV_FOLDER_PATH=/absolute/path/to/your/cvs  # folder containing PDF/DOCX files
 ```
 
-**That's it.** Those are the only 3 values you must set.
+All other values have sensible defaults. See [Section 6](#6-environment-variables-reference) for the full reference.
 
 ### Step 3 — Build the Docker image
 
@@ -105,75 +261,169 @@ CV_FOLDER_PATH=./cvs
 docker compose build
 ```
 
-This downloads the AI embedding model and all dependencies. Takes 5–15 minutes on first run depending on your internet speed. **Only needed once.**
+This takes 10–20 minutes on first run (downloads Python packages and pre-bakes the embedding model). Subsequent builds use the Docker layer cache and take ~30 seconds unless `requirements.txt` changes.
 
----
-
-## Loading Your CVs (Indexing)
-
-Indexing reads your CV files, converts them to AI vectors, and stores them in the database. You must do this before the screening API will return any results.
-
-### Drop your CVs in the folder
-
-Copy your CV files (`.pdf` or `.docx`) into the `cvs/` folder, or update `CV_FOLDER_PATH` in `.env` to point to your existing CV storage location.
-
-```
-cvs/
-├── john_doe_backend_engineer.pdf
-├── jane_smith_data_analyst.docx
-├── raj_kumar_fullstack.pdf
-└── ... (any number of files, subdirectories supported)
-```
-
-### Run the indexer
+### Step 4 — Index your CVs
 
 ```bash
 docker compose run --rm indexer
 ```
 
-You'll see progress in the terminal:
+This scans `CV_FOLDER_PATH`, parses every PDF and DOCX, embeds them, and stores them in Qdrant. You'll see progress logs like:
 
 ```
-2024-01-15 10:23:01 | INFO     | Found 20,000 CV files to process
-2024-01-15 10:23:01 | INFO     | ✓  john_doe.pdf → 'John Doe' (8 chunks)
-2024-01-15 10:23:02 | INFO     | ✓  jane_smith.docx → 'Jane Smith' (6 chunks)
+2024-01-15 10:23:01 | INFO | indexer.run | Scanning /app/cvs...
+2024-01-15 10:23:01 | INFO | indexer.run | Found 847 CV files
+2024-01-15 10:23:05 | INFO | indexer.run | [1/847] Indexing john_doe.pdf → 6 chunks
+2024-01-15 10:24:12 | INFO | indexer.run | [2/847] Indexing jane_smith.docx → 8 chunks
 ...
-2024-01-15 10:45:22 | INFO     | Indexing Complete (1340.2s)
-2024-01-15 10:45:22 | INFO     |   Scanned  : 20000
-2024-01-15 10:45:22 | INFO     |   Indexed  : 20000
-2024-01-15 10:45:22 | INFO     |   Skipped  : 0
-2024-01-15 10:45:22 | INFO     |   Failed   : 3
+2024-01-15 10:51:33 | INFO | indexer.run | ─────────────────────────────
+2024-01-15 10:51:33 | INFO | indexer.run | Indexed: 847 | Skipped: 0 | Failed: 3
 ```
 
-**Indexing 20,000 CVs takes approximately 20–40 minutes** (CPU-only, varies by CV length).
+**Timing:** Roughly 1-3 minutes per 100 CVs on CPU. 20,000 CVs takes 3-6 hours on first run.
 
-> 💡 **Subsequent runs are fast.** The indexer tracks which files have changed using MD5 hashes. On re-run, only new or modified CVs are processed. A run with no changes completes in seconds.
-
----
-
-## Starting & Stopping the Service
-
-### Start the service (runs in background)
+### Step 5 — Start the service
 
 ```bash
 docker compose up -d
 ```
 
-The service is ready when the health check passes. Check status:
+Verify everything is running:
 
 ```bash
 docker compose ps
+# Expected:
+# resume_screener_qdrant   running (healthy)
+# resume_screener_api      running (healthy)
+
+curl http://localhost:8000/health
+# Expected: {"status":"healthy","qdrant_connected":true,"model_loaded":true,"version":"1.0.0"}
 ```
 
-You should see both `resume_screener_qdrant` and `resume_screener_api` showing **healthy**.
+---
 
-### Verify it's working
+## 6. Environment Variables Reference
+
+All variables go in your `.env` file (copy from `.env.example`).
+
+### Required
+
+| Variable | Example | Description |
+|---|---|---|
+| `API_KEY` | `s3cr3t-k3y-abc123` | Secret key for API authentication. Send as `X-API-Key` header in every request. |
+| `GROQ_API_KEY` | `gsk_xxxx...` | Groq API key for LLM reranking. Get free at console.groq.com. |
+| `CV_FOLDER_PATH` | `/home/user/cvs` | Absolute path to the folder containing CV files on the host machine. |
+
+### LLM Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_PROVIDER` | `groq` | LLM provider for reranking. Options: `groq`, `gemini`. |
+| `GROQ_MODEL` | `llama-3.1-8b-instant` | Groq model. Alternatives: `llama-3.3-70b-versatile` (slower, more accurate). |
+| `GEMINI_API_KEY` | _(empty)_ | Required only if `LLM_PROVIDER=gemini`. Get at aistudio.google.com. |
+| `GEMINI_MODEL` | `gemini-1.5-flash` | Gemini model to use. |
+
+### Screening Behaviour
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEFAULT_TOP_K` | `10` | How many candidates to return when `top_k` is not specified in the request. |
+| `RETRIEVAL_TOP_N` | `30` | How many chunks to fetch from Qdrant before deduplication. Increase to 50 for higher accuracy at the cost of slightly more compute. When filters are active, this is automatically tripled. |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | **Do not change** unless you know what you're doing. Changing requires a full re-index. |
+
+### OCR
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_OCR` | `true` | Enable Tesseract OCR fallback for scanned/image-only PDFs. Set `false` if all your CVs are digital. |
+
+### Server
+
+| Variable | Default | Description |
+|---|---|---|
+| `API_PORT` | `8000` | Port the API is exposed on. Access via `http://server-ip:8000`. |
+| `LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
+| `ALLOWED_ORIGINS` | `*` | CORS origins. Use `*` for open access or comma-separate domains: `https://erp.company.com,https://hr.company.com`. |
+
+### Qdrant
+
+| Variable | Default | Description |
+|---|---|---|
+| `QDRANT_HOST` | `qdrant` | Docker service name. **Do not change** — this is overridden in docker-compose.yml automatically. |
+| `QDRANT_PORT` | `6333` | Qdrant REST port. |
+| `QDRANT_COLLECTION` | `resumes` | Qdrant collection name where CV vectors are stored. |
+
+---
+
+## 7. Indexing CVs
+
+### Supported Formats
+
+| Format | Text Layer | Scanned/Image |
+|---|---|---|
+| `.pdf` | ✅ pdfplumber (fast, ~10ms/page) | ✅ Tesseract OCR (slow, ~3s/page) if `ENABLE_OCR=true` |
+| `.docx` | ✅ python-docx | ❌ Not applicable |
+| `.doc` | ❌ Not supported | ❌ Not supported |
+| `.png/.jpg` | ❌ Not supported | ❌ Not supported |
+
+> **For `.doc` files:** Convert to `.docx` using LibreOffice: `libreoffice --headless --convert-to docx *.doc`
+
+### Running the Indexer
 
 ```bash
-curl http://localhost:8000/health
+# First time or after adding new CVs:
+docker compose run --rm indexer
+
+# Check what was indexed:
+cat data/index_state.json | python -m json.tool | head -50
 ```
 
-Expected response:
+### How Incremental Indexing Works
+
+The indexer stores an MD5 hash of each file in `data/index_state.json`. On subsequent runs:
+
+- **File unchanged** → skipped instantly (hash match)
+- **File modified** → re-indexed (hash mismatch)
+- **New file** → indexed
+- **File deleted** → NOT automatically removed from Qdrant (see [Section 13](#13-updating--re-indexing))
+
+This means running the indexer on 20,000 CVs after adding 50 new ones takes ~2 minutes instead of 5 hours.
+
+### What Gets Extracted Per CV
+
+The indexer extracts and stores the following in Qdrant for every CV chunk:
+
+| Field | Type | Source | Notes |
+|---|---|---|---|
+| `candidate_id` | UUID5 | Deterministic from file path | Stable across re-index runs |
+| `name` | string | Heuristic: first capitalised 2-4 word line | Falls back to filename |
+| `cv_path` | string | Absolute path on host | Used by ERP to link to file |
+| `experience_years` | int \| null | Regex: "5 years of experience" patterns | null if not found |
+| `location` | string \| null | City alias map (55+ cities) | Normalised, e.g. "Gurugram" → "Gurgaon" |
+| `location_raw` | string \| null | Raw extracted location string | e.g. "New Delhi, India" |
+| `skills` | string[] | 130+ skill taxonomy keyword match | e.g. ["Python", "Docker", "PostgreSQL"] |
+| `email` | string \| null | Standard email regex | Lowercased |
+| `ocr_used` | bool | Parser detection | True if Tesseract was used |
+| `chunk_text` | string | 400-word window of CV text | Used as LLM context |
+
+---
+
+## 8. API Reference
+
+**Base URL:** `http://your-server-ip:8000`
+
+**Authentication:** All endpoints except `/health` require the `X-API-Key` header.
+
+**Interactive docs:** Visit `http://your-server-ip:8000/docs` in a browser for the full Swagger UI.
+
+---
+
+### GET /health
+
+Returns service status. **No authentication required.** Use for monitoring.
+
+**Response 200 — Healthy:**
 ```json
 {
   "status": "healthy",
@@ -183,241 +433,214 @@ Expected response:
 }
 ```
 
-### Stop the service
-
-```bash
-docker compose down
-```
-
-Your CV database is preserved in a Docker volume. Data is not lost when you stop.
-
-### View live logs
-
-```bash
-docker compose logs -f api       # API logs
-docker compose logs -f qdrant    # database logs
-```
-
-### Restart the service
-
-```bash
-docker compose restart api
+**Response 503 — Degraded:**
+```json
+{
+  "status": "degraded",
+  "qdrant_connected": false,
+  "model_loaded": true,
+  "version": "1.0.0"
+}
 ```
 
 ---
 
-## For HR: How to Use
+### POST /api/v1/screen
 
-> This section is written for non-technical HR staff using the service through the ERP interface.
-
-1. **Open the screening form** in your ERP system.
-2. **Paste the full Job Description** into the text field.
-3. **Set how many candidates** you want to see (default: 10).
-4. **Click "Screen Resumes"** and wait 5–10 seconds.
-5. **Review the results** — candidates are ranked from best fit to least fit, with a one-line reason for each.
-
-Each result shows:
-- **Candidate name**
-- **Fit score** (0–100%, higher = better match)
-- **Why they match** — one sentence from the AI explaining the fit
-- **CV file path** — so you can find and open their actual CV
-
-> 💡 **Tip:** The AI works best with detailed job descriptions. Include required skills, years of experience, location preferences, and any must-have qualifications.
-
----
-
-## ERP Integration Guide
-
-> This section is for the ERP development team implementing the API call.
-
-### Authentication
-
-Every request to the screening API (except `/health`) must include an API key in the request header:
-
-```
-X-API-Key: your-api-key-from-env-file
-```
-
-The API key is set in the `.env` file as `API_KEY`. The ERP team should obtain this value from whoever manages the server.
-
-Missing or wrong key → `401 Unauthorized`
-
----
-
-### API Reference
-
-#### `POST /api/v1/screen` — Screen candidates
-
-**Base URL:** `http://<server-ip>:8000`
+Screen CVs against a job description. Returns ranked candidates.
 
 **Headers:**
 ```
 Content-Type: application/json
-X-API-Key: <your-api-key>
+X-API-Key: your-api-key
 ```
 
-**Request Body:**
+#### Request Body
 
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `job_description` | string | ✅ Yes | — | Full text of the job description (min 20 chars) |
-| `top_k` | integer | No | 10 | Number of candidates to return (1–50) |
-| `filters` | object | No | `{}` | Optional filters (see below) |
-| `filters.min_experience` | integer | No | null | Minimum years of experience |
-| `filters.location` | string | No | null | Preferred location (matched by AI) |
-
-**Example Request:**
-```json
+```jsonc
 {
-  "job_description": "We are hiring a Senior Backend Engineer with 5+ years of Python experience. The candidate should be proficient in FastAPI, PostgreSQL, and have exposure to microservices architecture. Prior experience in fintech or ERP systems is a plus. Location: Delhi NCR, hybrid work model.",
-  "top_k": 10,
-  "filters": {
-    "min_experience": 5,
-    "location": "Delhi"
+  "job_description": "string (required, min 20 chars)",
+  "top_k": 10,          // optional, 1-50, default 10
+  "filters": {          // optional — all filter fields are optional
+    "min_experience": 3,               // int, minimum years (inclusive)
+    "max_experience": 10,              // int, maximum years (inclusive)
+    "location": "Delhi",               // string, substring match (case-insensitive)
+    "required_skills": ["Python", "Docker"],  // string[], ALL must be present
+    "strict": false                    // bool, default false (see Section 10)
   }
 }
 ```
 
-**Response Body:**
+**Full Request Field Reference:**
 
-| Field | Type | Description |
-|---|---|---|
-| `job_id` | string (UUID) | Unique ID for this screening request |
-| `screened_at` | string (ISO 8601) | Timestamp of when screening ran |
-| `candidates` | array | Ranked list of candidates |
-| `candidates[].candidate_id` | string | Unique candidate identifier |
-| `candidates[].name` | string | Candidate name (extracted from CV) |
-| `candidates[].score` | float (0.0–1.0) | Fit score (1.0 = perfect match) |
-| `candidates[].match_reasoning` | string | One-sentence AI explanation |
-| `candidates[].cv_path` | string | File path to the CV on the server |
+| Field | Type | Required | Default | Constraints |
+|---|---|---|---|---|
+| `job_description` | string | ✅ Yes | — | Min 20 chars |
+| `top_k` | integer | No | 10 | 1–50 |
+| `filters.min_experience` | integer | No | null | ≥ 0 |
+| `filters.max_experience` | integer | No | null | ≥ 0 |
+| `filters.location` | string | No | null | Case-insensitive substring match |
+| `filters.required_skills` | string[] | No | null | Must match taxonomy (case-insensitive) |
+| `filters.strict` | boolean | No | false | See [Section 10](#10-metadata-filtering-system) |
 
-**Example Response:**
-```json
+#### Response Body
+
+```jsonc
 {
-  "job_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-  "screened_at": "2024-01-15T10:30:00.123456+00:00",
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",  // UUID for this request
+  "screened_at": "2024-01-15T10:23:01.123456+00:00",  // ISO 8601 UTC
+  "total_filtered_out": 12,  // candidates excluded by hard filters
   "candidates": [
     {
-      "candidate_id": "3f7a2c1d-8b4e-5f6a-9c2d-1e0f4a8b7c6d",
-      "name": "Rahul Sharma",
-      "score": 0.94,
-      "match_reasoning": "5+ years Python and FastAPI experience with prior fintech ERP integration background.",
-      "cv_path": "/app/cvs/rahul_sharma.pdf"
-    },
-    {
-      "candidate_id": "7c3e9f2a-1d5b-4e8c-a6f0-2b3c7d9e1f4a",
-      "name": "Priya Mehta",
-      "score": 0.88,
-      "match_reasoning": "Strong PostgreSQL and microservices background; 6 years Python experience at scale.",
-      "cv_path": "/app/cvs/priya_mehta.docx"
+      "candidate_id": "a1b2c3d4-...",  // stable UUID5 from file path
+      "name": "Priya Sharma",
+      "score": 0.87,                   // 0.0–1.0 fit score from LLM
+      "match_reasoning": "Strong FastAPI and PostgreSQL background with 6 years matching the required seniority.",
+      "cv_path": "/app/cvs/priya_sharma.pdf",
+      "metadata": {
+        "experience_years": 6,         // null if could not be extracted
+        "location": "Bangalore",       // canonical city name, null if unknown
+        "location_raw": "Bengaluru, Karnataka",  // as found in CV
+        "skills": ["Python", "FastAPI", "PostgreSQL", "Docker", "AWS"],
+        "email": "priya.sharma@email.com"  // null if not found
+      },
+      "filter_flags": []               // empty = all checks passed cleanly
+      // Non-empty example: ["experience_unknown"]
+      // means experience filter was active but couldn't be extracted from CV
     }
   ]
 }
 ```
 
+**Full Response Field Reference:**
+
+| Field | Type | Description |
+|---|---|---|
+| `job_id` | UUID | Unique ID for this screening run. Log this for audit trails. |
+| `screened_at` | ISO 8601 string | UTC timestamp. |
+| `total_filtered_out` | integer | Count of candidates excluded by hard filters before reranking. |
+| `candidates[].candidate_id` | UUID5 | Stable — same CV file always gets same ID. |
+| `candidates[].name` | string | Name extracted from CV text. May fall back to filename. |
+| `candidates[].score` | float 0–1 | LLM-assigned fit score. Higher is better. |
+| `candidates[].match_reasoning` | string | One-sentence AI explanation. |
+| `candidates[].cv_path` | string | Server filesystem path. Map to your URL scheme (see [Section 9](#9-erp-integration-guide)). |
+| `candidates[].metadata.experience_years` | int \| null | Extracted experience. `null` means unknown. |
+| `candidates[].metadata.location` | string \| null | Normalised city. `null` means unknown. |
+| `candidates[].metadata.location_raw` | string \| null | Raw location string from CV. |
+| `candidates[].metadata.skills` | string[] | Matched skills from 130+ taxonomy. May not be exhaustive. |
+| `candidates[].metadata.email` | string \| null | Contact email from CV. |
+| `candidates[].filter_flags` | string[] | Non-empty if a filter was active but data was unavailable. Values: `experience_unknown`, `location_unknown`. |
+
+**Error Responses:**
+
+| HTTP Code | When | Response |
+|---|---|---|
+| 401 | Missing or wrong `X-API-Key` | `{"detail": "Invalid or missing API key..."}` |
+| 422 | Validation error (e.g. `top_k > 50`) | Pydantic validation detail |
+| 503 | Qdrant unreachable | `{"detail": "Vector retrieval failed..."}` |
+
 ---
 
-#### `GET /health` — Service health check
+## 9. ERP Integration Guide
 
-No authentication required.
+This section is for the ERP development team. The API speaks standard HTTP/JSON — no special client library is needed.
 
-**Example Request:**
+### Authentication Pattern
+
+Every request to `/api/v1/screen` must include:
 ```
-GET http://<server-ip>:8000/health
+X-API-Key: <value of API_KEY from .env>
 ```
 
-**Example Response (healthy):**
-```json
-{
-  "status": "healthy",
-  "qdrant_connected": true,
-  "model_loaded": true,
-  "version": "1.0.0"
+Store this key in your ERP's secret management (environment variable, secrets vault, etc.). Never hardcode it.
+
+### Mapping cv_path to a Download URL
+
+`cv_path` in the response is the server-side filesystem path (e.g. `/app/cvs/john_doe.pdf`). Your ERP needs to translate this to a URL that HR can click to open the CV.
+
+**Option A — Shared network drive / NFS mount:**
+If the CV folder is on a shared drive accessible from both the server and the ERP, strip the `/app/cvs/` prefix and prepend your file server path.
+
+```javascript
+const cvUrl = candidate.cv_path.replace('/app/cvs/', '\\\\fileserver\\cvs\\');
+```
+
+**Option B — Serve CVs via nginx:**
+Add a static file server to docker-compose or your nginx config:
+```nginx
+location /cvs/ {
+    alias /path/to/your/cvs/;
+    add_header Content-Disposition inline;
 }
 ```
+Then: `cv_path.replace('/app/cvs/', 'http://server-ip/cvs/')`
 
-**HTTP Status Codes:**
-- `200` — Service is healthy
-- `503` — Service is degraded (Qdrant or model issue)
+**Option C — ERP already manages CV storage:**
+If CVs are stored in your ERP's document system, `cv_path` contains the original filename. Match on filename: `path.basename(cv_path)` → look up in your ERP's document table.
 
-> 💡 **Tip:** Call `/health` before displaying the screening form to show users whether the service is available.
+### Integration Code Examples
 
----
-
-#### Interactive API Documentation
-
-The API ships with built-in interactive documentation at:
-
-- **Swagger UI:** `http://<server-ip>:8000/docs`
-- **ReDoc:** `http://<server-ip>:8000/redoc`
-
-These pages let you test the API directly from your browser with no code required.
-
----
-
-### Code Examples
-
-#### cURL (terminal / shell scripts)
-
+#### cURL
 ```bash
-curl -X POST http://localhost:8000/api/v1/screen \
+curl -X POST http://your-server:8000/api/v1/screen \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: your-api-key-here" \
+  -H "X-API-Key: your-api-key" \
   -d '{
-    "job_description": "Looking for a Data Analyst with SQL, Python, and Power BI experience. Minimum 3 years in a corporate environment.",
-    "top_k": 5
+    "job_description": "Senior Python Developer with FastAPI experience...",
+    "top_k": 10,
+    "filters": {
+      "min_experience": 3,
+      "location": "Delhi",
+      "required_skills": ["Python"]
+    }
   }'
 ```
 
----
-
 #### Python (requests)
-
 ```python
 import requests
 
-API_URL = "http://localhost:8000"
-API_KEY = "your-api-key-here"
+SCREENER_URL = "http://your-server:8000"
+API_KEY = "your-api-key"
 
-def screen_candidates(job_description: str, top_k: int = 10) -> dict:
+def screen_candidates(job_description: str, top_k: int = 10, filters: dict = None):
     response = requests.post(
-        f"{API_URL}/api/v1/screen",
-        headers={
-            "Content-Type": "application/json",
-            "X-API-Key": API_KEY,
-        },
+        f"{SCREENER_URL}/api/v1/screen",
+        headers={"X-API-Key": API_KEY},
         json={
             "job_description": job_description,
             "top_k": top_k,
+            "filters": filters or {},
         },
-        timeout=30,  # seconds — LLM reranking takes 3–8s
+        timeout=30,
     )
     response.raise_for_status()
     return response.json()
 
-
 # Usage
 result = screen_candidates(
-    job_description="Senior Python Developer, FastAPI, 5+ years, Delhi",
-    top_k=10,
+    job_description="Looking for a senior Python developer...",
+    top_k=5,
+    filters={"min_experience": 5, "required_skills": ["Python", "Docker"]},
 )
 
 for candidate in result["candidates"]:
-    print(f"{candidate['name']:30} Score: {candidate['score']:.0%}")
-    print(f"  → {candidate['match_reasoning']}")
-    print()
+    print(f"{candidate['name']} — Score: {candidate['score']:.2f}")
+    print(f"  Reasoning: {candidate['match_reasoning']}")
+    print(f"  Experience: {candidate['metadata']['experience_years']} years")
+    print(f"  Location: {candidate['metadata']['location']}")
+    print(f"  Skills: {', '.join(candidate['metadata']['skills'][:5])}")
+    if candidate["filter_flags"]:
+        print(f"  ⚠ Flags: {', '.join(candidate['filter_flags'])}")
 ```
 
----
-
 #### JavaScript / Node.js (fetch)
-
 ```javascript
-const API_URL = 'http://localhost:8000';
-const API_KEY = 'your-api-key-here';
+const SCREENER_URL = 'http://your-server:8000';
+const API_KEY = process.env.SCREENER_API_KEY;
 
-async function screenCandidates(jobDescription, topK = 10) {
-  const response = await fetch(`${API_URL}/api/v1/screen`, {
+async function screenCandidates(jobDescription, topK = 10, filters = {}) {
+  const response = await fetch(`${SCREENER_URL}/api/v1/screen`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -426,58 +649,55 @@ async function screenCandidates(jobDescription, topK = 10) {
     body: JSON.stringify({
       job_description: jobDescription,
       top_k: topK,
+      filters,
     }),
+    signal: AbortSignal.timeout(30000),
   });
 
   if (!response.ok) {
     const error = await response.json();
-    throw new Error(`Screening failed: ${error.detail}`);
+    throw new Error(`Screener error ${response.status}: ${JSON.stringify(error)}`);
   }
 
   return response.json();
 }
 
 // Usage
-try {
-  const result = await screenCandidates(
-    'Senior Python Developer, FastAPI, 5+ years, Delhi',
-    10,
-  );
+const result = await screenCandidates(
+  'Looking for a Data Analyst with SQL and Power BI...',
+  10,
+  { min_experience: 2, location: 'Mumbai', required_skills: ['SQL', 'Power BI'] }
+);
 
-  result.candidates.forEach((c, i) => {
-    console.log(`#${i + 1} ${c.name} — ${(c.score * 100).toFixed(0)}%`);
-    console.log(`     ${c.match_reasoning}`);
-  });
-} catch (err) {
-  console.error('Screening error:', err.message);
-}
+console.log(`Screened at: ${result.screened_at}`);
+console.log(`Filtered out: ${result.total_filtered_out} candidates`);
+result.candidates.forEach((c, i) => {
+  console.log(`${i + 1}. ${c.name} (${c.score.toFixed(2)}) — ${c.match_reasoning}`);
+});
 ```
 
----
-
-#### PHP (cURL)
-
+#### PHP
 ```php
 <?php
+function screenCandidates(string $jobDescription, int $topK = 10, array $filters = []): array {
+    $url = 'http://your-server:8000/api/v1/screen';
+    $apiKey = getenv('SCREENER_API_KEY');
 
-define('API_URL', 'http://localhost:8000');
-define('API_KEY', 'your-api-key-here');
-
-function screenCandidates(string $jobDescription, int $topK = 10): array {
     $payload = json_encode([
         'job_description' => $jobDescription,
-        'top_k'           => $topK,
+        'top_k' => $topK,
+        'filters' => $filters,
     ]);
 
-    $ch = curl_init(API_URL . '/api/v1/screen');
+    $ch = curl_init($url);
     curl_setopt_array($ch, [
-        CURLOPT_POST           => true,
-        CURLOPT_POSTFIELDS     => $payload,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $payload,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 30,
-        CURLOPT_HTTPHEADER     => [
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_HTTPHEADER => [
             'Content-Type: application/json',
-            'X-API-Key: ' . API_KEY,
+            'X-API-Key: ' . $apiKey,
         ],
     ]);
 
@@ -486,173 +706,148 @@ function screenCandidates(string $jobDescription, int $topK = 10): array {
     curl_close($ch);
 
     if ($httpCode !== 200) {
-        throw new RuntimeException("Screening API error: HTTP $httpCode — $response");
+        throw new RuntimeException("Screener returned HTTP $httpCode: $response");
     }
 
     return json_decode($response, true);
 }
 
 // Usage
-try {
-    $result = screenCandidates('Senior Python Developer, FastAPI, 5+ years, Delhi', 10);
+$result = screenCandidates(
+    'Senior Accountant with Tally and GST experience...',
+    10,
+    ['min_experience' => 3, 'required_skills' => ['Tally', 'GST']]
+);
 
-    foreach ($result['candidates'] as $i => $candidate) {
-        $score = number_format($candidate['score'] * 100, 0);
-        echo "#" . ($i + 1) . " {$candidate['name']} — {$score}%\n";
-        echo "     {$candidate['match_reasoning']}\n\n";
-    }
-} catch (RuntimeException $e) {
-    error_log($e->getMessage());
+foreach ($result['candidates'] as $i => $candidate) {
+    echo ($i + 1) . ". {$candidate['name']} — Score: {$candidate['score']}\n";
+    echo "   {$candidate['match_reasoning']}\n";
 }
 ```
 
----
-
-#### C# / .NET (HttpClient)
-
+#### C# / .NET
 ```csharp
-using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Text;
-using System.Text.Json;
+using System.Net.Http.Json;
+
+public record ScreeningFilters(
+    int? MinExperience = null,
+    int? MaxExperience = null,
+    string? Location = null,
+    string[]? RequiredSkills = null,
+    bool Strict = false
+);
+
+public record ScreeningRequest(
+    string JobDescription,
+    int TopK = 10,
+    ScreeningFilters? Filters = null
+);
 
 public class ResumeScreenerClient
 {
     private readonly HttpClient _http;
-    private const string BaseUrl = "http://localhost:8000";
-    private const string ApiKey  = "your-api-key-here";
+    private const string BaseUrl = "http://your-server:8000";
 
-    public ResumeScreenerClient()
+    public ResumeScreenerClient(string apiKey)
     {
-        _http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
-        _http.DefaultRequestHeaders.Add("X-API-Key", ApiKey);
+        _http = new HttpClient { BaseAddress = new Uri(BaseUrl), Timeout = TimeSpan.FromSeconds(30) };
+        _http.DefaultRequestHeaders.Add("X-API-Key", apiKey);
     }
 
-    public async Task<ScreeningResponse> ScreenAsync(string jobDescription, int topK = 10)
+    public async Task<JsonElement> ScreenAsync(ScreeningRequest request)
     {
-        var payload = new { job_description = jobDescription, top_k = topK };
-        var content = new StringContent(
-            JsonSerializer.Serialize(payload),
-            Encoding.UTF8,
-            "application/json"
-        );
-
-        var response = await _http.PostAsync($"{BaseUrl}/api/v1/screen", content);
+        var response = await _http.PostAsJsonAsync("/api/v1/screen", request);
         response.EnsureSuccessStatusCode();
-
-        var json = await response.Content.ReadAsStringAsync();
-        return JsonSerializer.Deserialize<ScreeningResponse>(json)!;
+        return await response.Content.ReadFromJsonAsync<JsonElement>();
     }
 }
 
-// Models
-public record Candidate(string candidate_id, string name, float score,
-                        string match_reasoning, string cv_path);
-public record ScreeningResponse(string job_id, List<Candidate> candidates, string screened_at);
+// Usage
+var client = new ResumeScreenerClient(Environment.GetEnvironmentVariable("SCREENER_API_KEY")!);
+var result = await client.ScreenAsync(new ScreeningRequest(
+    JobDescription: "Senior Java Developer with Spring Boot and microservices...",
+    TopK: 10,
+    Filters: new ScreeningFilters(MinExperience: 5, RequiredSkills: ["Java", "Spring Boot"])
+));
+
+foreach (var candidate in result.GetProperty("candidates").EnumerateArray())
+{
+    Console.WriteLine($"{candidate.GetProperty("name")} — {candidate.GetProperty("score"):F2}");
+    Console.WriteLine($"  {candidate.GetProperty("match_reasoning")}");
+}
 ```
 
----
-
-#### Java (HttpClient — Java 11+)
-
+#### Java 11+
 ```java
+import java.net.http.*;
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 public class ResumeScreenerClient {
+    private static final String BASE_URL = "http://your-server:8000";
+    private final HttpClient client = HttpClient.newHttpClient();
+    private final ObjectMapper mapper = new ObjectMapper();
+    private final String apiKey;
 
-    private static final String BASE_URL = "http://localhost:8000";
-    private static final String API_KEY  = "your-api-key-here";
+    public ResumeScreenerClient(String apiKey) { this.apiKey = apiKey; }
 
-    private final HttpClient client = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(10))
-        .build();
-
-    public String screenCandidates(String jobDescription, int topK) throws Exception {
-        String body = String.format(
-            "{\"job_description\":\"%s\",\"top_k\":%d}",
-            jobDescription.replace("\"", "\\\""), topK
+    public Map<String, Object> screen(String jobDescription, int topK, Map<String, Object> filters)
+            throws Exception {
+        var body = Map.of(
+            "job_description", jobDescription,
+            "top_k", topK,
+            "filters", filters
         );
 
-        HttpRequest request = HttpRequest.newBuilder()
+        var request = HttpRequest.newBuilder()
             .uri(URI.create(BASE_URL + "/api/v1/screen"))
-            .timeout(Duration.ofSeconds(30))
             .header("Content-Type", "application/json")
-            .header("X-API-Key", API_KEY)
-            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .header("X-API-Key", apiKey)
+            .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
+            .timeout(Duration.ofSeconds(30))
             .build();
 
-        HttpResponse<String> response = client.send(
-            request, HttpResponse.BodyHandlers.ofString()
-        );
+        var response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
-        if (response.statusCode() != 200) {
-            throw new RuntimeException("API error: " + response.statusCode() + " " + response.body());
-        }
-        return response.body(); // Parse with your preferred JSON library (Gson, Jackson, etc.)
+        if (response.statusCode() != 200)
+            throw new RuntimeException("Screener error " + response.statusCode() + ": " + response.body());
+
+        return mapper.readValue(response.body(), Map.class);
     }
 }
 ```
 
----
+### ERP Integration Patterns
 
-### Integration Patterns
-
-#### Pattern 1: Inline Screening (Synchronous)
-
-Call the API directly when the HR user clicks "Screen". Best for simple ERP setups.
+#### Pattern 1 — Synchronous (Simple ERP, Recommended for most cases)
 
 ```
-User clicks "Screen"
-      │
-      ▼
-ERP backend calls POST /api/v1/screen
-      │  (awaits response, ~5–8 seconds)
-      ▼
-ERP renders candidate table to user
+HR opens job form → fills JD → clicks "Screen Candidates"
+→ ERP calls POST /api/v1/screen
+→ ERP waits up to 30 seconds
+→ ERP renders ranked candidate list inline
 ```
 
-**Considerations:**
-- Show a loading spinner while waiting (expected 5–8s)
-- Set HTTP timeout to at least 30 seconds
-- If the API returns 503, show "Service unavailable, try again in a moment"
+This works for typical response times of 3-8 seconds. Ensure the UI shows a loading spinner.
 
----
-
-#### Pattern 2: Async with Polling (Recommended for complex ERPs)
-
-Submit screening in the background, poll for results. Better UX for enterprise systems.
+#### Pattern 2 — Asynchronous (For ERPs with strict timeout budgets)
 
 ```
-User clicks "Screen"
-      │
-      ▼
-ERP stores job_description in its DB → creates a ScreeningJob record
-      │
-      ▼
-Background worker calls POST /api/v1/screen
-      │
-      ▼
-Worker stores response in ScreeningJob.results
-      │
-      ▼
-Frontend polls ERP endpoint every 2s until results are ready
+HR submits JD
+→ ERP calls POST /api/v1/screen in background job
+→ HR sees "Screening in progress..." 
+→ ERP polls or uses webhook notification when done
+→ HR sees results
 ```
 
-This pattern lets the ERP track screening history and avoids browser timeout issues.
+Use this if your ERP framework has a hard HTTP timeout < 10 seconds.
 
----
-
-#### Pattern 3: Check Health Before Showing Form
+#### Pattern 3 — Health Gate (Check before exposing the screening form)
 
 ```javascript
-// On page load — only show the screening form if the service is up
-async function checkServiceAvailability() {
+async function isScreenerAvailable() {
   try {
-    const res = await fetch('http://localhost:8000/health', { signal: AbortSignal.timeout(3000) });
+    const res = await fetch('http://your-server:8000/health', { signal: AbortSignal.timeout(3000) });
     const data = await res.json();
     return data.status === 'healthy';
   } catch {
@@ -660,293 +855,496 @@ async function checkServiceAvailability() {
   }
 }
 
-const isAvailable = await checkServiceAvailability();
-if (!isAvailable) {
-  showBanner('Resume screening is temporarily unavailable. Contact IT.');
+// In your form rendering logic:
+if (await isScreenerAvailable()) {
+  showScreeningButton();
+} else {
+  showFallbackMessage("AI screening is temporarily unavailable. Please screen manually.");
 }
 ```
 
+#### Pattern 4 — Handling filter_flags in the UI
+
+When a candidate has `filter_flags: ["experience_unknown"]`, it means the experience filter was active but experience could not be extracted from the CV. Suggested UI treatment:
+
+```
+┌─────────────────────────────────────────────────┐
+│ 3. Rajesh Kumar          Score: 0.79            │
+│    "Strong SQL and SAP background..."            │
+│    📍 Mumbai  |  💼 Experience: Unknown          │
+│    ⚠ Experience could not be verified from CV.  │
+│      Please review CV manually.                  │
+└─────────────────────────────────────────────────┘
+```
+
 ---
 
-#### Pattern 4: Displaying CV Links
+## 10. Metadata Filtering System
 
-The `cv_path` field in the response is the **server-side file path**. To let HR open CVs, your ERP needs to either:
+### How Filtering Works
 
-**Option A — Serve CVs directly from the ERP:**
-Map the server path to a download URL in your ERP backend.
+Filters are applied **after** vector search but **before** LLM reranking. This means:
+
+1. Qdrant returns 90 candidates (3× the usual 30, buffered for filtering)
+2. Python filter logic runs in-memory: negligible time
+3. Surviving candidates (say 25) go to the LLM
+4. LLM returns top 10
+
+**Strict vs. Lenient mode:**
+
+| Scenario | `strict: false` (default) | `strict: true` |
+|---|---|---|
+| CV has `experience_years: 6`, filter is `min_experience: 5` | ✅ Passes | ✅ Passes |
+| CV has `experience_years: 3`, filter is `min_experience: 5` | ❌ Excluded | ❌ Excluded |
+| CV has `experience_years: null` (couldn't extract), filter is `min_experience: 5` | ✅ Passes + `filter_flags: ["experience_unknown"]` | ❌ Excluded |
+
+**When to use `strict: true`:** When you have high confidence that CVs in your database are well-structured (digital, not scanned) and that the metadata extractor will reliably find the relevant fields. In this case, candidates without extractable metadata are likely anomalies.
+
+**When to use `strict: false` (default):** Always a safer choice. Candidates with unknown metadata are surfaced to HR with a flag, rather than silently discarded.
+
+### Location Matching
+
+The location filter uses **case-insensitive substring matching** on both the normalised city name and the raw extracted string:
+
+| Filter value | Matches | Does not match |
+|---|---|---|
+| `"Delhi"` | Delhi, Delhi NCR, New Delhi, New Delhi, India | Mumbai, Bangalore |
+| `"Bangalore"` | Bangalore, Bengaluru, Bangalore, Karnataka | Mysore |
+| `"Mumbai"` | Mumbai, Mumbai, Maharashtra, Navi Mumbai | Pune |
+| `"NCR"` | Delhi NCR | New Delhi (city only) |
+
+**Note:** Location extraction covers 55+ Indian cities and major international cities. If a CV uses an unusual format or a smaller city name, `location` will be `null`. Set `strict: false` to include those candidates.
+
+### Skills Filtering
+
+`required_skills` uses **ALL-must-match** semantics:
+
+```json
+"required_skills": ["Python", "Docker", "PostgreSQL"]
+```
+
+A candidate must have **all three** skills in their extracted skill list to pass. If any one is missing, the candidate is excluded.
+
+Skills are matched case-insensitively against the 130+ entry taxonomy in `indexer/metadata.py`. Valid skill names include: `Python`, `Java`, `JavaScript`, `TypeScript`, `React`, `Angular`, `Vue`, `FastAPI`, `Django`, `Flask`, `Spring Boot`, `Docker`, `Kubernetes`, `AWS`, `Azure`, `GCP`, `PostgreSQL`, `MySQL`, `MongoDB`, `Redis`, `Elasticsearch`, `Machine Learning`, `Deep Learning`, `NLP`, `SAP`, `ERP`, `Tally`, `Power BI`, `Tableau`, `Excel`, `Agile`, `Scrum`, and many more.
+
+**View the full taxonomy:** Open `indexer/metadata.py` and look at the `_SKILL_TAXONOMY` dictionary.
+
+---
+
+## 11. OCR Support for Scanned PDFs
+
+When a PDF has no readable text layer (scanned paper CV, image-embedded PDF), the indexer automatically falls back to Tesseract OCR.
+
+### How OCR is Triggered
 
 ```python
-# Example: Python/Django ERP view
-CV_SERVER_BASE = "/app/cvs"       # server path prefix
-CV_DOWNLOAD_BASE = "/hr/cv-files" # ERP URL prefix
-
-def cv_url(cv_path: str) -> str:
-    relative = cv_path.replace(CV_SERVER_BASE, "").lstrip("/")
-    return f"{CV_DOWNLOAD_BASE}/{relative}"
+# parser.py logic:
+text = pdfplumber.extract()
+if len(text.strip()) < 100 chars AND ENABLE_OCR=true:
+    text = tesseract_ocr(pages)  # ~3 seconds per page
 ```
 
-**Option B — Use the cv_path as a network share path:**
-If the CV folder is on a shared drive, the path may already be directly openable by HR workstations.
+Regular digital PDFs are **never slowed down** by OCR — it only activates when text extraction fails.
+
+### OCR Performance
+
+| Scenario | Time per CV |
+|---|---|
+| Digital PDF (text layer) | ~0.1–0.5s |
+| Scanned PDF (OCR) | ~3–10s depending on page count |
+| DOCX | ~0.1–0.3s |
+
+### OCR Quality
+
+Tesseract works well on:
+- Clean scans (300 DPI+)
+- Single-column layouts
+- Standard fonts
+
+Tesseract struggles with:
+- Low resolution scans (< 150 DPI)
+- Complex multi-column layouts
+- Handwritten text
+- Non-English text (only English is installed)
+
+### Disabling OCR
+
+If all CVs are digital and you want faster indexing:
+```env
+ENABLE_OCR=false
+```
 
 ---
 
-### Error Reference
+## 12. Monitoring & Maintenance
 
-| HTTP Status | Meaning | What to do |
-|---|---|---|
-| `200 OK` | Success | Parse and display results |
-| `400 Bad Request` | Invalid request body | Check that `job_description` is at least 20 characters |
-| `401 Unauthorized` | Missing or wrong API key | Verify the `X-API-Key` header matches the `API_KEY` in `.env` |
-| `422 Unprocessable Entity` | Invalid field types | Check request body against the API reference above |
-| `503 Service Unavailable` | Qdrant is down or not indexed | Check `/health` endpoint; may need to restart Qdrant or run indexer |
-| Network timeout | Service not reachable | Check that Docker containers are running (`docker compose ps`) |
-
-**Empty candidates array:** If the response contains `"candidates": []`, the CV collection has not been indexed yet. Run `docker compose run --rm indexer`.
-
----
-
-## Configuration Reference
-
-All configuration is in the `.env` file. Here is the full reference:
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `API_KEY` | ✅ Yes | — | Secret key for authenticating API requests |
-| `GROQ_API_KEY` | ✅ Yes* | — | Groq API key (*if `LLM_PROVIDER=groq`) |
-| `GEMINI_API_KEY` | ✅ Yes* | — | Gemini API key (*if `LLM_PROVIDER=gemini`) |
-| `LLM_PROVIDER` | No | `groq` | LLM provider: `groq` or `gemini` |
-| `GROQ_MODEL` | No | `llama-3.1-8b-instant` | Groq model to use |
-| `GEMINI_MODEL` | No | `gemini-1.5-flash` | Gemini model to use |
-| `CV_FOLDER_PATH` | No | `./cvs` | Path to CV folder (supports relative and absolute paths) |
-| `QDRANT_HOST` | No | `qdrant` | Qdrant hostname (use `qdrant` inside Docker, `localhost` outside) |
-| `QDRANT_PORT` | No | `6333` | Qdrant port |
-| `QDRANT_COLLECTION` | No | `resumes` | Name of the Qdrant collection |
-| `DEFAULT_TOP_K` | No | `10` | Default number of candidates to return |
-| `RETRIEVAL_TOP_N` | No | `30` | Candidates fetched from vector DB before LLM reranking |
-| `EMBEDDING_MODEL` | No | `all-MiniLM-L6-v2` | Embedding model name (**do not change** without re-indexing) |
-| `API_PORT` | No | `8000` | Port the API is exposed on |
-| `LOG_LEVEL` | No | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| `ALLOWED_ORIGINS` | No | `*` | CORS origins (comma-separated); use `*` to allow all |
-
----
-
-## Updating CVs
-
-When you add, remove, or update CVs in your folder:
-
-### Adding new CVs
-
-1. Copy new `.pdf` or `.docx` files into the CV folder
-2. Run: `docker compose run --rm indexer`
-3. Only the new files are processed (unchanged files are skipped)
-
-### Modifying an existing CV
-
-1. Replace the file with the updated version
-2. Run: `docker compose run --rm indexer`
-3. The indexer detects the file has changed (MD5 hash differs) and re-indexes it
-
-### Removing CVs
-
-1. Delete the file from the folder
-2. Run: `docker compose run --rm indexer`
-
-> ⚠️ **Note:** The deleted file's vectors remain in Qdrant. They will still appear in results until you reset the database. To fully remove deleted CVs, reset the database and re-index:
-> ```bash
-> docker volume rm resume_screener_qdrant_data
-> docker compose run --rm indexer
-> ```
-
----
-
-## Monitoring & Health
-
-### Quick status check
+### Daily Health Check
 
 ```bash
-# Check all containers are running and healthy
+# Check all services are running
 docker compose ps
 
-# Check API is responding
+# Quick health API check
 curl http://localhost:8000/health
 
-# Check how many CV chunks are in the database
-curl http://localhost:6333/collections/resumes
+# View last 100 log lines from API
+docker compose logs --tail=100 api
+
+# View last 100 lines from Qdrant
+docker compose logs --tail=100 qdrant
 ```
 
-### Viewing logs
+### Qdrant Dashboard
+
+Qdrant ships with a web dashboard at `http://your-server:6333/dashboard`. It shows:
+- Collection info (vector count, disk usage)
+- Memory usage
+- Query performance stats
+
+No login required (it's local-only by default).
+
+### Collection Stats
 
 ```bash
-# Live API logs
-docker compose logs -f api
-
-# Last 100 lines of indexer output from the last run
-docker compose logs --tail=100 indexer
-
-# Qdrant logs
-docker compose logs -f qdrant
+curl http://localhost:6333/collections/resumes
+# Shows: vectors_count, indexed_vectors_count, disk_data_size
 ```
 
-### Qdrant Web Dashboard
+### Restarting Services
 
-Qdrant includes a built-in web dashboard for inspecting the database:
+```bash
+# Restart just the API (e.g. after .env change)
+docker compose restart api
 
+# Restart everything
+docker compose down && docker compose up -d
+
+# Rebuild after code changes
+docker compose down
+docker compose build
+docker compose up -d
 ```
-http://localhost:6333/dashboard
-```
 
-Use this to see how many vectors are stored, run test queries, and monitor database health.
+### Viewing Screening Logs
+
+Every screening request is logged with:
+- `job_id` (UUID)
+- `top_k`
+- JD character count
+- Active filters
+- Number of candidates filtered out
+- Number of candidates returned
+
+```bash
+docker compose logs api | grep "Screening request"
+docker compose logs api | grep "Returning"
+```
 
 ---
 
-## Troubleshooting
+## 13. Updating & Re-indexing
 
-### ❌ `docker compose ps` shows containers as unhealthy
+### Adding New CVs
+
+1. Drop new PDF/DOCX files into the CV folder (`CV_FOLDER_PATH`)
+2. Run the indexer:
+   ```bash
+   docker compose run --rm indexer
+   ```
+3. The indexer skips all existing files (hash match) and only processes new ones.
+4. New candidates are immediately searchable — no API restart needed.
+
+### Modifying Existing CVs
+
+1. Replace the file in the CV folder
+2. Run the indexer — it detects the hash change and re-indexes that file
+3. Old vectors for that candidate are **overwritten** (same `candidate_id` because it's UUID5 from file path)
+
+> **Note:** Old chunk vectors from a previous version of the file may remain in Qdrant if the new version produces fewer chunks. This is a known limitation. To clean up completely, reset the collection and re-index all CVs.
+
+### Deleting CVs
+
+Deleting a file from the CV folder does **not** automatically remove it from Qdrant. To fully remove a candidate:
 
 ```bash
-# Check what's wrong
-docker compose logs qdrant
+# Find their candidate_id from index_state.json
+cat data/index_state.json | python -c "
+import json, sys
+state = json.load(sys.stdin)
+for path, info in state.items():
+    if 'john_doe' in path:
+        print(path, '->', info['candidate_id'])
+"
+
+# Delete their vectors from Qdrant
+curl -X POST http://localhost:6333/collections/resumes/points/delete \
+  -H "Content-Type: application/json" \
+  -d '{"filter": {"must": [{"key": "candidate_id", "match": {"value": "UUID-HERE"}}]}}'
+
+# Remove from index_state.json manually or re-run indexer which will clean missing files
+```
+
+### ⚠️ Re-indexing After a Code Update
+
+**This is critical.** If you update the indexer (e.g. metadata.py or embedder.py) and want the new metadata fields to be stored for existing CVs, you must **reset Qdrant and re-index all CVs**:
+
+```bash
+# 1. Stop everything
+docker compose down
+
+# 2. Delete the Qdrant volume (destroys all vectors!)
+docker volume rm resume_screener_qdrant_data
+
+# 3. Delete the state file so indexer re-processes everything
+rm data/index_state.json
+
+# 4. Rebuild (if code changed)
+docker compose build
+
+# 5. Start Qdrant only
+docker compose up -d qdrant
+
+# 6. Re-index all CVs (this will take hours for 20k CVs)
+docker compose run --rm indexer
+
+# 7. Start the API
+docker compose up -d api
+```
+
+**When is a full re-index required?**
+- After updating `indexer/metadata.py` (new fields you want filterable)
+- After updating `indexer/embedder.py` (changed payload structure)
+- After changing `EMBEDDING_MODEL` (different vector dimensions)
+- After upgrading Qdrant version (sometimes schema changes)
+
+**When is a full re-index NOT required?**
+- After updating `api/reranker.py` (no index changes)
+- After updating `api/retriever.py` (no index changes)
+- After updating `api/main.py` or `api/models.py`
+- After changing `.env` values (except `EMBEDDING_MODEL`)
+
+---
+
+## 14. Troubleshooting
+
+### Service won't start
+
+```bash
 docker compose logs api
-
-# Restart
-docker compose restart
 ```
 
-### ❌ `/health` returns `"qdrant_connected": false`
+**Common causes:**
+- `.env` not created (copy from `.env.example`)
+- `API_KEY` not set in `.env`
+- `GROQ_API_KEY` not set in `.env`
+- Port 8000 already in use: change `API_PORT` in `.env`
 
-Qdrant is not reachable from the API container.
+### Health check shows degraded
 
 ```bash
-# Check Qdrant is running
-docker compose ps qdrant
-
-# Restart Qdrant
-docker compose restart qdrant
-
-# Wait 15 seconds, then restart the API
-docker compose restart api
+curl http://localhost:8000/health
+# {"status":"degraded","qdrant_connected":false,"model_loaded":true}
 ```
 
-### ❌ Screening returns `"candidates": []`
+Qdrant is not responding. Check:
+```bash
+docker compose ps qdrant     # should show "healthy"
+docker compose logs qdrant   # look for error messages
+```
 
-The database is empty. You need to index your CVs:
+### No candidates returned
 
+**Cause 1:** CVs not indexed.
 ```bash
 docker compose run --rm indexer
 ```
 
-If the indexer ran but still empty, check that `CV_FOLDER_PATH` in `.env` points to the right directory and that it contains `.pdf` or `.docx` files.
+**Cause 2:** All candidates filtered out by hard filters.
+Check `total_filtered_out` in the response. Try removing filters or using `strict: false`.
 
-### ❌ `401 Unauthorized` errors from ERP
+**Cause 3:** JD text is too short or too generic.
+Use a specific, detailed job description (100+ words recommended).
 
-The API key doesn't match. Check:
-1. What `API_KEY` is set to in your `.env` file on the server
-2. What the ERP is sending in the `X-API-Key` header
-3. They must be exactly equal (case-sensitive, no extra spaces)
+### Screening returns 503
 
-### ❌ Indexer runs but many files show `Failed`
+The API can't reach Qdrant. Usually means:
+```bash
+docker compose restart qdrant
+docker compose restart api
+```
+
+### Indexer fails on some files
 
 ```bash
-# Run indexer with debug logging for more detail
-docker compose run --rm -e LOG_LEVEL=DEBUG indexer
+docker compose run --rm indexer 2>&1 | grep -i "failed\|error\|warning"
 ```
 
-Common causes:
-- **Scanned PDFs** (image-only, no text layer) — not supported, will be skipped with a warning
-- **Password-protected PDFs** — not supported, will fail
-- **Corrupted files** — will fail gracefully and be skipped
+Each file failure is isolated — others continue indexing. Failed files are **not** marked in the state file, so re-running the indexer will retry them.
 
-### ❌ `GROQ_API_KEY` errors / LLM reranking fails
+**PDF fails with no text extracted:**
+- Digital PDF: check if it's password-protected
+- Scanned PDF: ensure `ENABLE_OCR=true` in `.env`
 
-The screening still works — it falls back to semantic similarity scores automatically. But to fix:
+**DOCX fails:**
+- File may be corrupted. Try opening in LibreOffice.
 
-1. Check your key is correct: visit [console.groq.com](https://console.groq.com)
-2. Check you haven't hit the free tier rate limit (14,400 req/day)
-3. Check outbound internet is available from the server: `curl https://api.groq.com`
+### LLM reranking fails / slow
 
-### ❌ Port 8000 is already in use
+If Groq is down or rate-limited:
+- The service auto-falls back to vector score ranking
+- `match_reasoning` will say "Ranked by semantic similarity..."
+- This is expected behaviour — not a bug
 
-Change the port in `.env`:
-```env
-API_PORT=8080
+To check Groq status: [status.groq.com](https://status.groq.com)
+
+To increase rate limit: upgrade Groq plan or switch to `GEMINI` provider.
+
+### Scanned PDFs not being OCR'd
+
+```bash
+# Check OCR is enabled
+grep ENABLE_OCR .env
+
+# Check Tesseract is installed in the container
+docker compose exec api tesseract --version
 ```
-Then restart: `docker compose down && docker compose up -d`
 
-### ❌ `docker compose build` fails with network errors
-
-The server may have blocked PyPI or Docker Hub. Check with IT that outbound connections to these domains are allowed:
-- `registry-1.docker.io`
-- `pypi.org`
-- `files.pythonhosted.org`
-- `download.pytorch.org`
+If Tesseract is missing, rebuild:
+```bash
+docker compose build --no-cache
+```
 
 ---
 
-## Architecture
+## 15. Developer Handoff Notes
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Docker Compose Stack                     │
-│                                                             │
-│  ┌─────────────────────────┐    ┌──────────────────────┐   │
-│  │   FastAPI API (:8000)   │───▶│  Qdrant DB (:6333)   │   │
-│  │                         │    │  (Named Volume)      │   │
-│  │  • Auth middleware       │    │  384-dim cosine      │   │
-│  │  • JD embedding (CPU)    │    │  vectors             │   │
-│  │  • Vector retrieval      │    └──────────────────────┘   │
-│  │  • LLM reranking        │                               │
-│  └────────────┬────────────┘                               │
-│               │                                             │
-└───────────────┼─────────────────────────────────────────────┘
-                │  (one HTTPS call per screen request)
-                ▼
-         Groq / Gemini API
+> **This section is written for the developer (and their agentic IDE) taking over this project.**
+
+### Codebase Philosophy
+
+- **No magic.** Every design decision is documented in the relevant module's docstring. Read `api/retriever.py` first — it has a particularly detailed explanation of why we use post-retrieval filtering over Qdrant native filters.
+- **Fault isolation.** Every external call (Qdrant, LLM, file IO) has explicit error handling. The indexer never crashes on a single bad CV file. The API never returns 500 due to LLM issues.
+- **Stateless API, stateful indexer.** The API holds no session state. The indexer maintains `data/index_state.json` for incremental runs.
+
+### Module Responsibilities (Quick Map)
+
+| Module | Responsibility | Key functions |
+|---|---|---|
+| `api/main.py` | App factory, lifespan, auth middleware, routes | `create_app()`, `screen_resumes()`, `health_check()` |
+| `api/models.py` | API contract (Pydantic) | `ScreeningRequest`, `ScreeningResponse`, `Candidate`, `CandidateMetadata`, `ScreeningFilters` |
+| `api/retriever.py` | Vector search + post-retrieval filtering | `retrieve_candidates()`, `build_candidate_response()`, `_apply_filters()` |
+| `api/reranker.py` | LLM reranking with fallback | `rerank_candidates()`, `_fallback_ranking()`, `_build_prompt()` |
+| `indexer/run.py` | Indexing orchestrator | `main()` — walk files, hash check, parse, embed, save state |
+| `indexer/parser.py` | CV text extraction + OCR | `parse_file()`, `_parse_pdf()`, `_parse_pdf_ocr()`, `_chunk_text()` |
+| `indexer/metadata.py` | Structured data extraction | `extract_metadata()`, `_extract_experience()`, `_extract_location()`, `_extract_skills()` |
+| `indexer/embedder.py` | MiniLM encoding + Qdrant upsert | `embed_and_upsert()`, `ensure_collection()` |
+| `indexer/utils.py` | Hashing, state file, logging | `compute_md5()`, `get_candidate_id()`, `load_state()`, `save_state()` |
+
+### Key Data Flows to Understand
+
+**1. Candidate ID stability**
+`candidate_id` is a UUID5 derived from the absolute file path (`indexer/utils.py :: get_candidate_id()`). This means the same file always gets the same ID across re-index runs. This is intentional — it lets the ERP safely store a `candidate_id` as a foreign key.
+
+**2. Metadata null propagation**
+`CVMetadata` fields default to `None`. `None` flows through to the Qdrant payload, then to the `CandidateMetadata` response model. The filter logic in `retriever.py` explicitly handles `None` with the `strict` flag. **Never assume a metadata field is non-null.**
+
+**3. Retrieval buffer when filtering**
+`retrieve_candidates()` in `retriever.py` multiplies `top_n` by `_FILTER_RETRIEVAL_MULTIPLIER = 3` when any filter is active. This compensates for candidates that will be filtered out. If you're changing filter logic, be aware that tightening filters may need this multiplier increased.
+
+**4. Single image, two roles**
+The `Dockerfile` produces one image used for both `api` and `indexer`. The difference is the `CMD`: `api` runs `uvicorn`; `indexer` overrides with `python -m indexer.run`. Both share the same Python environment and pre-baked model.
+
+### Where to Add Features
+
+| Feature | Where to change |
+|---|---|
+| Add a new metadata field (e.g. `education_level`) | `indexer/metadata.py` (extraction) → `indexer/embedder.py` (payload) → `api/models.py` (response) → `api/retriever.py` (filter check) |
+| Add a new filter type | `api/models.py` (field) → `api/retriever.py` (`_apply_filters`) |
+| Add a new LLM provider | `api/reranker.py` (new branch in `rerank_candidates`) |
+| Support `.doc` files | `indexer/parser.py` (add `_parse_doc` using `subprocess + libreoffice`) |
+| Add multilingual OCR | `Dockerfile` (add `tesseract-ocr-hin` etc.) → `indexer/parser.py` (`lang` param to pytesseract) |
+| Add webhook on index completion | `indexer/run.py` (call endpoint after summary) |
+| Add authentication per ERP tenant | `api/main.py` (multi-key middleware) → `.env.example` (document key format) |
+
+### Testing (Currently None — Add Before Production)
+
+No tests exist. Priority order for first tests:
+1. `tests/test_metadata.py` — unit test `extract_metadata()` with sample CV texts
+2. `tests/test_retriever.py` — unit test `_apply_filters()` with mock candidate dicts
+3. `tests/test_api.py` — integration test `/health` and `/api/v1/screen` with a real Qdrant instance
+4. `tests/test_parser.py` — test `parse_file()` with sample PDFs and DOCX files
+
+Recommended: pytest + httpx for async tests.
+
+### Environment for Local Dev (Without Docker)
+
+```bash
+# Create venv
+python -m venv .venv
+.venv\Scripts\activate  # Windows
+source .venv/bin/activate  # Linux/Mac
+
+# Install CPU torch first
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install everything else
+pip install -r requirements.txt
+
+# Start Qdrant locally (Docker still needed for this)
+docker run -d -p 6333:6333 -p 6334:6334 qdrant/qdrant:v1.9.2
+
+# Set env vars
+cp .env.example .env
+# Edit .env: set API_KEY, GROQ_API_KEY, CV_FOLDER_PATH, QDRANT_HOST=localhost
+
+# Run API
+uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+
+# Run indexer
+python -m indexer.run
 ```
 
-**Indexer (run manually):**
-```
-cvs/ folder → parser.py (PDF/DOCX) → embedder.py (MiniLM) → Qdrant
-                                         ↑
-                               data/index_state.json
-                               (tracks file hashes for skip logic)
-```
+### Known Limitations
 
-**Embedding model:** `all-MiniLM-L6-v2` (90 MB, runs on CPU)
-- Converts text to 384-dimensional vectors
-- Same model used at index time and query time (required for correct similarity)
-
-**LLM Reranker:** Groq (default) or Gemini Flash
-- Called once per `/screen` request
-- Receives job description + ~10 candidate summaries (not full CVs)
-- Returns ranked list with scores and reasoning
+1. **Deleted CV handling:** Removing a CV from the folder does not remove its vectors from Qdrant. Must be done manually (see Section 13).
+2. **Metadata extraction is heuristic:** ~20-30% of CVs may have null experience/location. This is expected. The `strict` filter flag and `filter_flags` response field handle this gracefully.
+3. **LLM reranker is English-only:** The Groq/Gemini prompt and reasoning will be in English regardless of the CV language. Non-English CVs still match semantically via MiniLM.
+4. **No concurrent indexing protection:** Running two indexer instances simultaneously will cause duplicate Qdrant points. Only run one indexer at a time.
+5. **OCR quality varies:** Tesseract at 200 DPI works well for clean scans but fails on very low quality or handwritten content.
 
 ---
 
-## FAQ
-
-**Q: Can I use this without a Groq/Gemini API key?**
-Yes. If the LLM call fails (bad key, rate limit, no internet), the service automatically falls back to pure semantic similarity ranking. You lose the AI-written reasoning, but results are still returned.
+## 16. FAQ
 
 **Q: How accurate is the screening?**
-The semantic embedding step finds candidates whose CV text is semantically similar to the job description. The LLM reranking step refines this using role understanding. Results are significantly better than keyword matching but should always be reviewed by a human recruiter.
+A: Semantic accuracy for well-written JDs and CVs is high. The MiniLM embedding captures conceptual similarity (not just keywords), and the LLM reranker adds contextual reasoning. Expect to manually review borderline candidates (scores 0.5–0.7).
 
-**Q: What CV formats are supported?**
-`.pdf` and `.docx`. Note: scanned PDFs (image-only, no text layer) cannot be processed and will be skipped. Word documents created by any version of Microsoft Word or LibreOffice work.
+**Q: What happens if Groq goes down?**
+A: The API automatically falls back to Qdrant vector score ranking. `match_reasoning` will say "Ranked by semantic similarity (AI reranker temporarily unavailable)." The service never goes down due to LLM issues.
 
-**Q: Is candidate data sent to the AI provider?**
-Only short text excerpts (~800 words) from the top ~10 candidates are sent per request. Full CVs are never transmitted. No data is stored on the AI provider's side beyond their standard API request logging.
+**Q: Will filters miss candidates whose CVs don't mention their location or experience?**
+A: With `strict: false` (default), those candidates are included and flagged with `filter_flags: ["experience_unknown"]` or `["location_unknown"]`. HR can review them manually. With `strict: true`, they're excluded.
 
-**Q: Can multiple users use this simultaneously?**
-Yes, but with some caveats. The API handles concurrent requests, but the embedding model is loaded once and CPU-only, so very high concurrency (10+ simultaneous screens) may cause slowdowns. For a 3-person HR team, this is not a concern.
+**Q: How often should I re-index?**
+A: Run the indexer whenever new CVs are added. It's incremental — only new/changed files are processed. For a rolling hiring pipeline, a weekly scheduled run is reasonable.
 
-**Q: How do I back up the CV database?**
-Back up the Docker volume `resume_screener_qdrant_data`. Alternatively, simply keep your `cvs/` folder and `data/index_state.json` backed up — you can always rebuild the Qdrant database by running the indexer again.
+**Q: Is candidate data stored outside the server?**
+A: CV content is sent to Groq/Gemini as part of the reranking prompt (CV excerpt up to 800 characters per candidate). If this is a concern, switch to `strict=false`, use longer JDs so semantic search is sufficient without LLM reranking, or run a locally-hosted LLM (would require code changes to `reranker.py`).
 
-**Q: The server was restarted. Do I need to re-index?**
-No. Qdrant data is in a persistent Docker named volume and survives server reboots. Run `docker compose up -d` after restart and the service is ready immediately.
+**Q: Can I run this without a Groq API key?**
+A: Yes, but results will be lower quality. Without a valid Groq key, every request falls back to pure vector score ranking (no LLM reasoning). Set `LLM_PROVIDER=groq` and use an invalid key to trigger fallback mode intentionally.
 
-**Q: Can I change the AI provider later?**
-Yes. Change `LLM_PROVIDER` in `.env` from `groq` to `gemini` (and set `GEMINI_API_KEY`), then restart: `docker compose restart api`. No re-indexing needed.
+**Q: Can multiple users query the API simultaneously?**
+A: Yes. The API is async (uvicorn with FastAPI). The embedding model and Qdrant client are loaded once and reused across all requests. Practical concurrent capacity: 3-5 simultaneous requests on a modern CPU server before latency degrades.
 
-**Q: How do I add support for more CV file types?**
-The parser module (`indexer/parser.py`) can be extended. Open a request with the developer.
+**Q: How do I backup the CV database?**
+A: Two things to backup:
+1. The CV files themselves (your `CV_FOLDER_PATH` directory)
+2. `data/index_state.json` (the indexer state)
+3. The Qdrant volume: `docker run --rm -v resume_screener_qdrant_data:/data -v $(pwd):/backup alpine tar czf /backup/qdrant_backup.tar.gz /data`
+
+**Q: Can I change the embedding model?**
+A: Technically yes, but it requires a full re-index (delete Qdrant volume + delete `index_state.json` + run indexer). You also need to update `EMBEDDING_MODEL` in `.env` and ensure the new model's output dimension matches the Qdrant collection dimension (delete collection if different). Not recommended unless you know what you're doing.
+
+**Q: The indexer crashed halfway through. What now?**
+A: Just re-run it. `data/index_state.json` tracks completed files. Only the files that successfully completed are in the state file — the interrupted one will be retried.

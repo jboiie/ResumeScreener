@@ -49,6 +49,8 @@ services:
     environment:
       # Override Qdrant host to use the Docker service name
       - QDRANT_HOST=qdrant
+      # OCR for scanned PDFs — set to false in .env to disable
+      - ENABLE_OCR=${ENABLE_OCR:-true}
     volumes:
       # CV folder: read-only access (indexer writes; API never modifies CVs)
       - ${CV_FOLDER_PATH:-./cvs}:/app/cvs:ro
@@ -75,6 +77,7 @@ services:
       - .env
     environment:
       - QDRANT_HOST=qdrant
+      - ENABLE_OCR=${ENABLE_OCR:-true}
     volumes:
       - ${CV_FOLDER_PATH:-./cvs}:/app/cvs:ro
       - ./data:/app/data

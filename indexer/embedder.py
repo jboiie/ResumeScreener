@@ -20,24 +20,35 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-VECTOR_DIM    = 384   # Output dimension of all-MiniLM-L6-v2
+# Note: VECTOR_DIM is derived at runtime from the loaded model.
+# Do NOT hardcode it here — changing EMBEDDING_MODEL in .env would cause
+# a silent dimension mismatch that breaks every upsert.
 BATCH_ENCODE  = 64    # Chunks per SentenceTransformer encode call
 BATCH_UPSERT  = 100   # Points per Qdrant upsert call
 
 
 # ── Qdrant Collection Management ──────────────────────────────────────────────
 
-def ensure_collection(client: QdrantClient, collection_name: str) -> None:
+def ensure_collection(
+    client: QdrantClient,
+    collection_name: str,
+    vector_dim: int,
+) -> None:
     """
     Create the Qdrant collection if it does not already exist.
     Safe to call on every indexer run.
+
+    Args:
+        vector_dim: Embedding dimension reported by the loaded model.
+                    Derived at runtime via model.get_sentence_embedding_dimension()
+                    so that changing EMBEDDING_MODEL in .env works correctly.
     """
     existing = {c.name for c in client.get_collections().collections}
     if collection_name not in existing:
-        logger.info("Creating Qdrant collection '%s' (dim=%d, cosine)", collection_name, VECTOR_DIM)
+        logger.info("Creating Qdrant collection '%s' (dim=%d, cosine)", collection_name, vector_dim)
         client.create_collection(
             collection_name=collection_name,
-            vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE),
+            vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
         )
     else:
         logger.debug("Collection '%s' already exists — skipping creation", collection_name)

@@ -88,12 +88,17 @@ def main() -> None:
         )
         sys.exit(1)
 
-    ensure_collection(qdrant, COLLECTION)
-
     # ── Load embedding model ───────────────────────────────────────
+    # Model must be loaded before ensure_collection so we can pass
+    # the actual vector dimension (model.get_sentence_embedding_dimension())
+    # instead of a hardcoded constant.
     logger.info("Loading embedding model: %s", EMBEDDING_MODEL)
     model = SentenceTransformer(EMBEDDING_MODEL)
-    logger.info("Embedding model ready")
+    vector_dim = model.get_sentence_embedding_dimension()
+    logger.info("Embedding model ready (dim=%d)", vector_dim)
+
+    ensure_collection(qdrant, COLLECTION, vector_dim)
+
 
     # ── Discover CV files ──────────────────────────────────────────
     all_files = [

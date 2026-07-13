@@ -10,7 +10,7 @@
 #    - Model pre-baked   → no download on first container start
 # ══════════════════════════════════════════════════════════════
 
-FROM python:3.10-slim
+FROM python:3.10.14-slim-bookworm
 
 # ── System dependencies ─────────────────────────────────────────
 # curl:          healthchecks and Qdrant connectivity tests
@@ -23,6 +23,9 @@ RUN apt-get update \
         tesseract-ocr-eng \
         poppler-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd --create-home --shell /bin/bash appuser
 
 WORKDIR /app
 
@@ -40,6 +43,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ── Pre-download embedding model ────────────────────────────────
 # Bakes the model into the image so first startup is instant.
 # The model (~90 MB) is stored in the HuggingFace cache inside the image.
+ENV HF_HOME=/app/.cache/huggingface
+RUN mkdir -p /app/.cache && chown appuser /app/.cache
 RUN python -c "\
 from sentence_transformers import SentenceTransformer; \
 print('Downloading all-MiniLM-L6-v2 ...'); \
@@ -53,6 +58,10 @@ COPY indexer/  ./indexer/
 # Persistent directories (mounted from host via docker-compose volumes)
 RUN mkdir -p cvs data
 
+# Switch to non-root user before copying app code
+USER appuser
+
 # ── Default command (API service) ───────────────────────────────
 # Overridden to "python -m indexer.run" for the indexer profile.
+EXPOSE 8000
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

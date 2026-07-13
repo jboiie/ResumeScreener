@@ -138,12 +138,14 @@ app = create_app()
 
 # ── Auth Middleware ────────────────────────────────────────────────────────────
 
-_PUBLIC_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
+# Prefix-match so /docs, /docs/, and Swagger asset sub-paths all pass through.
+# FastAPI redirects /docs → /docs/ internally; exact-match blocked the redirect target.
+_PUBLIC_PREFIXES = ("/health", "/docs", "/redoc", "/openapi.json")
 
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    if request.url.path in _PUBLIC_PATHS:
+    if any(request.url.path.startswith(p) for p in _PUBLIC_PREFIXES):
         return await call_next(request)
 
     provided_key = request.headers.get("X-API-Key", "")

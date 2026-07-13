@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ── Request Models ─────────────────────────────────────────────────────────────
@@ -62,13 +62,30 @@ class ScreeningFilters(BaseModel):
     )
 
     def is_active(self) -> bool:
-        """Return True if any filter field is set."""
+        """Return True if any filter field has a meaningful value set."""
         return any([
             self.min_experience is not None,
             self.max_experience is not None,
             self.location is not None,
-            self.required_skills is not None,
+            # Treat empty list as inactive — [] provides no filtering criteria
+            # but would otherwise trigger 3x retrieval multiplier for no benefit
+            bool(self.required_skills),
         ])
+
+    @model_validator(mode="after")
+    def validate_experience_range(self) -> "ScreeningFilters":
+        """Ensure min_experience does not exceed max_experience.
+
+        Without this, a request with min=10, max=5 silently returns zero
+        results because no candidate can satisfy exp>=10 AND exp<=5.
+        """
+        if self.min_experience is not None and self.max_experience is not None:
+            if self.min_experience > self.max_experience:
+                raise ValueError(
+                    f"min_experience ({self.min_experience}) cannot exceed "
+                    f"max_experience ({self.max_experience})"
+                )
+        return self
 
 
 class ScreeningRequest(BaseModel):
@@ -77,13 +94,17 @@ class ScreeningRequest(BaseModel):
     job_description: str = Field(
         ...,
         min_length=20,
+        max_length=50000,  # ~10 pages; prevents OOM on runaway inputs
         description="Full text of the job description to screen against",
     )
-    top_k: int = Field(
-        default=10,
+    top_k: Optional[int] = Field(
+        default=None,
         ge=1,
         le=50,
-        description="Number of top candidates to return (max 50)",
+        description=(
+            "Number of top candidates to return (max 50). "
+            "Defaults to DEFAULT_TOP_K env var (default: 10)."
+        ),
     )
     filters: ScreeningFilters = Field(
         default_factory=ScreeningFilters,

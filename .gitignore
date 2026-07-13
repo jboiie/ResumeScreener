@@ -40,5 +40,16 @@ desktop.ini
 # ── IDE ─────────────────────────────────────────────────
 .vscode/
 .idea/
+.cursor/
+.agents/
+.gemini/
 *.swp
 *.swo
+
+# ── Testing ─────────────────────────────────────────────
+htmlcov/
+.coverage
+*.tmp.json
+
+# ── Env overrides ───────────────────────────────────────
+.env*.local

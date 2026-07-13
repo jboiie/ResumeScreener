@@ -28,7 +28,7 @@ GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-_LLM_TIMEOUT_SECONDS = 20
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "20"))
 
 # Maximum candidates sent to the LLM in a single prompt.
 # With 800-char excerpts + metadata, 15 candidates fit comfortably in
@@ -90,28 +90,37 @@ REQUIRED OUTPUT FORMAT:
 
 # ── LLM Callers ───────────────────────────────────────────────────────────────
 
-def _call_groq(prompt: str) -> str:
-    from groq import Groq  # type: ignore  # lazy import
+_groq_client = None
+_gemini_model = None
+_genai_module = None
 
-    client = Groq(api_key=GROQ_API_KEY)
-    response = client.chat.completions.create(
+def _call_groq(prompt: str) -> str:
+    global _groq_client
+    if _groq_client is None:
+        from groq import Groq  # type: ignore  # lazy import
+        _groq_client = Groq(api_key=GROQ_API_KEY)
+
+    response = _groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.1,
-        timeout=_LLM_TIMEOUT_SECONDS,
+        timeout=LLM_TIMEOUT,
     )
     return response.choices[0].message.content or ""
 
 
 def _call_gemini(prompt: str) -> str:
-    import google.generativeai as genai  # type: ignore  # lazy import
+    global _gemini_model, _genai_module
+    if _gemini_model is None:
+        import google.generativeai as genai  # type: ignore  # lazy import
+        _genai_module = genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        _gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    response = model.generate_content(
+    response = _gemini_model.generate_content(
         prompt,
-        generation_config=genai.GenerationConfig(temperature=0.1),
-        request_options={"timeout": _LLM_TIMEOUT_SECONDS},
+        generation_config=_genai_module.GenerationConfig(temperature=0.1),
+        request_options={"timeout": LLM_TIMEOUT},
     )
     return response.text or ""
 

@@ -135,6 +135,7 @@ def main() -> None:
         f for f in CV_FOLDER.rglob("*")
         if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
     ]
+    all_files.sort()
 
     if not all_files:
         logger.warning(

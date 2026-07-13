@@ -69,7 +69,7 @@ class ScreeningFilters(BaseModel):
             self.location is not None,
             # Treat empty list as inactive — [] provides no filtering criteria
             # but would otherwise trigger 3x retrieval multiplier for no benefit
-            bool(self.required_skills),
+            self.required_skills is not None and len(self.required_skills) > 0,
         ])
 
     @model_validator(mode="after")

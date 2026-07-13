@@ -1279,6 +1279,10 @@ Recommended: pytest + httpx for async tests.
 ### Environment for Local Dev (Without Docker)
 
 ```bash
+# Install system dependencies (required for OCR and PDF parsing)
+# Linux (Debian/Ubuntu): sudo apt-get install tesseract-ocr poppler-utils
+# Mac (Homebrew): brew install tesseract poppler
+
 # Create venv
 python -m venv .venv
 .venv\Scripts\activate  # Windows
@@ -1338,7 +1342,7 @@ A: Yes, but results will be lower quality. Without a valid Groq key, every reque
 A: Yes. The API is async (uvicorn with FastAPI). The embedding model and Qdrant client are loaded once and reused across all requests. Practical concurrent capacity: 3-5 simultaneous requests on a modern CPU server before latency degrades.
 
 **Q: How do I backup the CV database?**
-A: Two things to backup:
+A: Three things to backup:
 1. The CV files themselves (your `CV_FOLDER_PATH` directory)
 2. `data/index_state.json` (the indexer state)
 3. The Qdrant volume: `docker run --rm -v resume_screener_qdrant_data:/data -v $(pwd):/backup alpine tar czf /backup/qdrant_backup.tar.gz /data`

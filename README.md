@@ -2,7 +2,7 @@
 
 > **For the incoming developer:** This document is written to be consumed directly by you and your agentic IDE. Every section is intentionally verbose. Read it top to bottom once before touching any code.
 
-A production-ready, self-hosted REST microservice that accepts a **Job Description** and returns the **top N most relevant candidates** from a database of up to 20,000 CVs. Built on a Retrieval-Augmented Generation (RAG) pipeline. Delivered as a Docker Compose product that runs on a single server with no GPU required.
+A production-ready, self-hosted REST microservice that accepts a **Job Description** and returns the **top N most relevant candidates** from a database of 200,000+ CVs. Built on a Retrieval-Augmented Generation (RAG) pipeline. Delivered as a Docker Compose product that runs on a single server with no GPU required.
 
 ---
 
